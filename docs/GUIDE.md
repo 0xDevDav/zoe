@@ -5,13 +5,18 @@ How Zoe works, part by part: what each piece does, the rules it follows and why.
 
 ## How it works
 
-```
-Telegram  ──►  Poller  ──►  SQLite queue  ──►  Worker  ──►  Claude
-                                ▲                 │
-                     Planner  ──┘                 │
-                         Whisper server  ◄────────┤
-                         ElevenLabs      ◄────────┤
-                                                  └──►  Brain (neuron graph)
+```mermaid
+flowchart TD
+    T["Telegram"] --> P["Poller"]
+    P --> Q["SQLite queue"]
+    L["Planner"] --> Q
+    Q --> W["Worker"]
+    W --> C["Claude"]
+    W --> S["Whisper server"]
+    W --> E["ElevenLabs"]
+    W --> B["Brain<br/>neuron graph"]
+    classDef key stroke:#e07a52,stroke-width:2px
+    class W key
 ```
 
 - **Poller** long-polls Telegram and writes every inbound message to SQLite

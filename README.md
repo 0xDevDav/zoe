@@ -40,10 +40,6 @@ where it happens.
 
 ## A brain, not a notebook
 
-<table>
-<tr>
-<td width="62%" valign="top">
-
 **Every piece of knowledge is a neuron.** A fact, a preference, a habit, a goal, a
 correction, a past conversation, a file worth keeping. Each is wired to the
 conversation it came from, and what one conversation teaches is wired together.
@@ -61,15 +57,12 @@ observer learns from finished conversations without slowing them, and a nightly
 review, the way sleep does, merges what says the same thing, rewrites what changed
 and forgets what was never lasting.
 
-</td>
-<td width="38%" valign="top">
-<img src="docs/screenshots/memory.png" alt="What Zoe knows about you">
-</td>
-</tr>
-</table>
+<p align="center">
+  <img src="docs/screenshots/memory.png" alt="What Zoe knows about you" width="300">
+</p>
 
 ```mermaid
-flowchart LR
+flowchart TD
     M["Your message<br/>and the last four"] --> W["Words<br/>rarest first"]
     M --> S["Meaning<br/>local model"]
     W --> A["Spreading activation<br/>along the synapses"]
@@ -102,10 +95,6 @@ such as a layer of concept neurons, were left out.
 
 ## She improves herself
 
-<table>
-<tr>
-<td width="62%" valign="top">
-
 **Every night she studies how she works.** A run with the owner's powers reads the
 last days: where she had to be corrected, what was asked by hand again and again,
 what broke. She changes nothing that works and proposes at most two improvements,
@@ -125,15 +114,12 @@ can be undone from the menu.
 **Her foundations are protected.** The launcher, the pipeline, permissions, the
 vault and the privacy guard change only when you explicitly ask.
 
-</td>
-<td width="38%" valign="top">
-<img src="docs/screenshots/mind.png" alt="A parallel mind at work">
-</td>
-</tr>
-</table>
+<p align="center">
+  <img src="docs/screenshots/mind.png" alt="A parallel mind at work" width="300">
+</p>
 
 ```mermaid
-flowchart LR
+flowchart TD
     N["Nightly study"] --> P["Proposal<br/>in the menu"]
     P -- "you approve" --> M["A parallel mind<br/>makes the change"]
     M --> T["Tests, privacy guard<br/>and independent review"]
