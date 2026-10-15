@@ -1,0 +1,36 @@
+/* Zoe's look: dark warm surfaces, orange accent, Sora for titles and Inter for text, no gradients. */
+@font-face {
+  font-family: "Inter";
+  font-style: normal;
+  font-weight: 400 700;
+  font-display: swap;
+  src: url("inter-latin.woff2") format("woff2");
+}
+@font-face {
+  font-family: "Sora";
+  font-style: normal;
+  font-weight: 600 800;
+  font-display: swap;
+  src: url("sora-latin.woff2") format("woff2");
+}
+:root {
+  color-scheme: dark;
+  --bg: #121110;
+  --surface: #1b1917;
+  --line: rgba(243, 239, 232, 0.08);
+  --text: #f3efe8;
+  --muted: rgba(243, 239, 232, 0.62);
+  --accent: #e07a52;
+  --on-accent: #1a120d;
+  --danger: #ef5b5b;
+  --font: "Inter", system-ui, -apple-system, sans-serif;
+  --font-display: "Sora", "Inter", system-ui, sans-serif;
+  --radius: 16px;
+}
+#logo { display: block; background: url("logo.png") center / cover; }
+.button { border-color: rgba(243, 239, 232, 0.16); }
+.button.success { font-weight: 700; }
+.button.danger { border-color: rgba(239, 91, 91, 0.35); }
+button.row:active { background: rgba(224, 122, 82, 0.13); }
+* { scrollbar-width: none; }
+*::-webkit-scrollbar { display: none; }

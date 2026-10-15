@@ -1,0 +1,9 @@
+#!/bin/sh
+# Block commits that would add personal data (see tools/privacy_check.py).
+for py in python3 python; do
+    if "$py" -c "import sys" >/dev/null 2>&1; then
+        exec "$py" tools/privacy_check.py --staged
+    fi
+done
+echo "privacy check: no Python interpreter found" >&2
+exit 1

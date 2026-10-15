@@ -1,0 +1,25 @@
+#!/bin/sh
+# Block pushes that would publish personal data anywhere in the pushed history.
+zero=0000000000000000000000000000000000000000
+
+python_bin() {
+    for py in python3 python; do
+        if "$py" -c "import sys" >/dev/null 2>&1; then
+            echo "$py"
+            return 0
+        fi
+    done
+    return 1
+}
+
+py=$(python_bin) || { echo "privacy check: no Python interpreter found" >&2; exit 1; }
+
+while read -r local_ref local_sha remote_ref remote_sha; do
+    [ "$local_sha" = "$zero" ] && continue
+    if [ "$remote_sha" = "$zero" ]; then
+        revisions="$local_sha"
+    else
+        revisions="$remote_sha..$local_sha"
+    fi
+    "$py" tools/privacy_check.py --range "$revisions" || exit 1
+done

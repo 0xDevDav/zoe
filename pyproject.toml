@@ -1,0 +1,30 @@
+[project]
+name = "zoe"
+version = "0.1.0"
+description = "A personal assistant on Telegram with a memory of neurons and synapses, who improves herself; runs on Claude Code"
+requires-python = ">=3.11"
+license = "MIT"
+authors = [{ name = "0xDevDav" }]
+dependencies = ["cryptography>=42"]
+
+[project.optional-dependencies]
+voice = ["faster-whisper>=1.0"]
+meaning = ["numpy>=1.26", "onnxruntime>=1.18", "tokenizers>=0.19"]
+
+[project.scripts]
+zoe = "zoe.app:main"
+zoe-run = "zoe.launcher:main"
+zoe-evolve = "zoe.evolve:main"
+zoe-vault = "zoe.vault:main"
+zoe-say = "zoe.say:main"
+zoe-whisper = "zoe.whisper_server:main"
+
+[build-system]
+requires = ["setuptools>=77"]
+build-backend = "setuptools.build_meta"
+
+[tool.setuptools]
+packages = ["zoe"]
+
+[tool.setuptools.package-data]
+zoe = ["schema.sql", "menu.html", "menu.js", "avatar.png", "theme/*"]

@@ -1,0 +1,33 @@
+# Zoe's speech recognition. Copy to /etc/systemd/system/zoe-whisper.service, then:
+# systemctl daemon-reload && systemctl enable --now zoe-whisper
+#
+# It runs as a throwaway user of its own, can only listen on the local machine,
+# and is held to part of the memory and the processors. The model is downloaded
+# on the first start into its cache; after that, HF_HUB_OFFLINE=1 keeps it off the
+# network for good.
+
+[Unit]
+Description=Zoe's speech recognition
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+DynamicUser=yes
+CacheDirectory=zoe-whisper
+Environment=HF_HOME=/var/cache/zoe-whisper
+Environment=ZOE_WHISPER_HOST=127.0.0.1
+# Environment=HF_HUB_OFFLINE=1
+ExecStart=/opt/zoe/.venv/bin/python -m zoe.whisper_server
+Restart=always
+RestartSec=5
+MemoryMax=4G
+CPUQuota=400%
+Nice=10
+NoNewPrivileges=yes
+ProtectSystem=strict
+ProtectHome=yes
+PrivateTmp=yes
+
+[Install]
+WantedBy=multi-user.target

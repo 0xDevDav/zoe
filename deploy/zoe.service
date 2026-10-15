@@ -1,0 +1,42 @@
+# Zoe, run by her launcher. Copy to /etc/systemd/system/zoe.service, adjust the
+# paths and the user, then: systemctl daemon-reload && systemctl enable --now zoe
+#
+# The owner's turns act on the machine with this user's powers, by design. A
+# dedicated user with only the sudo rights Zoe needs is safer than root; on root,
+# keep Zoe on a server of her own.
+#
+# Left out on purpose, because they break what the owner's turns are for:
+#   UMask=0077        files Zoe publishes elsewhere (a site) must stay readable by
+#                     other services; Zoe closes her own home at every start instead;
+#   PrivateTmp        Zoe reads logs other services leave in /tmp;
+#   ProtectSystem, NoNewPrivileges, RestrictSUIDSGID
+#                     installing software and administering the machine need them off.
+
+[Unit]
+Description=Zoe, a personal assistant on Telegram
+Wants=network-online.target
+After=network-online.target zoe-whisper.service
+
+[Service]
+Type=simple
+User=root
+WorkingDirectory=/opt/zoe
+Environment=ZOE_HOME=/root/.zoe
+# The vault key stays outside ZOE_HOME, so a copy of the home alone does not open
+# the vault. Move it there once:
+#   install -d -m 700 /etc/zoe
+#   mv /root/.zoe/vault.key /etc/zoe/vault.key && chmod 600 /etc/zoe/vault.key
+LoadCredential=vault-key:/etc/zoe/vault.key
+ExecStart=/opt/zoe/.venv/bin/python -m zoe.launcher
+Restart=always
+RestartSec=5
+# Stopping Zoe stops every process she started: turns, parallel minds, their tools.
+KillMode=control-group
+TimeoutStopSec=120
+# Room for the system and the other services, whatever Zoe's turns run.
+MemoryHigh=75%
+MemoryMax=85%
+TasksMax=1024
+
+[Install]
+WantedBy=multi-user.target
