@@ -292,7 +292,9 @@ def _end(conn: sqlite3.Connection, mind: Mind, event: str, text: str) -> None:
 _PHASES = (
     "Your very first message, before any tool, is one line that plans the work in two to eight phases of a few "
     "words each, studying the task included: [[{k} phases: Read the code | Write | Test | Fix]]. Each time you "
-    "start a phase, write [[{k} phase: 2]] with its number. {name} follows the bar they draw in the menu. When "
+    "start a phase, write [[{k} phase: 2]] with its number. A phase ends when its work is done, the commands it "
+    "waits for included: tests still running in the background keep their phase open, even while you do other "
+    "work meanwhile. {name} follows the bar they draw in the menu. When "
     "the plan changes, for example a test fails and the fix needs a phase of its own, write the phases line "
     "again with the whole new list. Only a task of one or two steps skips them."
 )
