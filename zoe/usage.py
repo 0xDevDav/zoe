@@ -31,6 +31,8 @@ _TIMEOUT = 90
 # "Current session: 42% used · resets Oct 14, 5:29pm (Europe/Rome)"
 _LINE = re.compile(r"^(?P<label>[^:\n]+):\s*(?P<used>\d+(?:\.\d+)?)% used(?:\W+resets\s+(?P<resets>.+?))?\s*$", re.M)
 _FORMATS = ("%b %d, %I:%M%p", "%b %d, %I%p")
+# A reset within the day is written as a bare time ("6pm", "5:30pm").
+_TIMES = ("%I:%M%p", "%I%p")
 
 
 @dataclass(frozen=True)
@@ -41,8 +43,8 @@ class Limit:
 
 
 def resets_at(text: str, now: datetime) -> float | None:
-    """When a limit resets, from how /usage writes it ("Oct 19, 3am (Europe/Rome)"), as a
-    timestamp; ``now`` carries its time zone."""
+    """When a limit resets, from how /usage writes it ("Oct 19, 3am (Europe/Rome)", or "6pm
+    (Europe/Rome)" within the day), as a timestamp; ``now`` carries its time zone."""
     zone = re.search(r"\s*\(([^)]+)\)\s*$", text)
     when = text[:zone.start()] if zone else text
     try:
@@ -58,6 +60,17 @@ def resets_at(text: str, now: datetime) -> float | None:
         # /usage leaves the year out: a reset more than a day behind is next year's.
         if moment < now - timedelta(days=1):
             moment = moment.replace(year=now.year + 1)
+        return moment.timestamp()
+    local = now.astimezone(tz)
+    for fmt in _TIMES:
+        try:
+            parsed = datetime.strptime(when.strip(), fmt)
+        except ValueError:
+            continue
+        moment = local.replace(hour=parsed.hour, minute=parsed.minute, second=0, microsecond=0)
+        # A bare time more than half a day behind is tomorrow's; one just passed is today's.
+        if moment < local - timedelta(hours=12):
+            moment += timedelta(days=1)
         return moment.timestamp()
     return None
 

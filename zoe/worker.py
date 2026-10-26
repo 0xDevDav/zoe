@@ -17,15 +17,17 @@ import sqlite3
 import threading
 import time
 from collections.abc import Callable
+from contextlib import closing
+from datetime import datetime
 from pathlib import Path
 
 from . import (
-    access, approve, claude_runner, choices, content, directives, files, formatting, i18n, minds, planner, prompt,
+    access, approve, availability, choices, content, directives, files, formatting, i18n, minds, planner, prompt,
     receipts, store, vocabulary,
 )
 from .access import Person
 from .brain import Brain
-from .claude_runner import ClaudeRunner, Profile, Result, Step, unavailable
+from .claude_runner import ClaudeRunner, Later, Profile, Result, Step, unavailable
 from .config import Config
 from .db import connect
 from .progress import Progress
@@ -46,11 +48,6 @@ ALBUM_WAIT = 1.5
 # last one before the turn stops to take them in.
 FOLLOWUP_POLL = 1.0
 FOLLOWUP_PAUSE = 2.5
-
-# Seconds between two tries while Claude cannot work at all.
-CLAUDE_RETRY = 60.0
-_claude_state = threading.Lock()
-
 
 _INTERNAL = (planner.PLAN, minds.EVENT)
 
@@ -106,7 +103,7 @@ class Worker(threading.Thread):
         log.info("%s started", self.name)
 
         while not self._halt.is_set():
-            if float(store.get_state(conn, claude_runner.RETRY_AT, "0")) > time.time():
+            if availability.waiting(conn):
                 self._halt.wait(5.0)
                 continue
             try:
@@ -213,7 +210,55 @@ class Worker(threading.Thread):
             result, key = Result(True, stored["text"], False, False, 0, 0.0), stored["key"]
         else:
             result = self._converse(conn, brain, person, read, prompt_text, profile, progress, fresh, session)
-        self._finish(conn, brain, person, read, recalled, result, spoken, key, progress)
+        try:
+            self._finish(conn, brain, person, read, recalled, result, spoken, key, progress)
+        finally:
+            if result.later:
+                threading.Thread(target=self._follow, args=(result.later, person.id, read, key),
+                                 name=f"{self.name}-later-{first.id}", daemon=True).start()
+
+    def _follow(self, later: Later, person_id: int, read: list[tuple[store.Message, str]], key: str) -> None:
+        """Deliver what a turn's session says after its answer, once the background tasks it
+        waits for end, as further replies of the same turn: each is delivered, remembered and
+        acted on like the first, in writing and with no progress message. Work stopped before
+        it ends is told to the person, except when the service stops: then a plan due at once
+        takes the waits up again after the start. The chat is free meanwhile: the next message
+        starts a turn and a session of its own, since only a stuck turn resumes its session."""
+        conn = connect(self._cfg.db_path)
+        try:
+            with closing(later.answers(self._halt)) as answers:
+                for result in answers:
+                    person = access.get_person(conn, person_id)
+                    if person is None:
+                        break
+                    if result.ok and result.text:
+                        self._finish(conn, Brain(conn, owner=person.id), person, read, prompt.Recall([], []),
+                                     result, False, key)
+                    elif result.cancelled and self._halt.is_set():
+                        self._resume_after_stop(conn, person, read, later.waits(), result.duration)
+                    elif not result.ok:
+                        log.warning("background work of message %d stopped after %.0fs", read[0][0].id,
+                                    result.duration)
+                        self._api.notify(read[0][0].chat_id, i18n.t(person.language, "background_stopped",
+                                                                    minutes=round(result.duration / 60)))
+        except Exception:
+            log.exception("background work of message %d not followed to its end", read[0][0].id)
+        finally:
+            conn.close()
+
+    def _resume_after_stop(self, conn: sqlite3.Connection, person: Person,
+                           read: list[tuple[store.Message, str]], waits: list[str], duration: float) -> None:
+        """Plan, due at once, the resumption of background waits that a stop of the service ended."""
+        msg = read[0][0]
+        instruction = prompt.STOPPED_WAITS.format(asked=read[0][1][:300], waits="\n".join(f"- {w}" for w in waits))
+        try:
+            planner.create(conn, Brain(conn, owner=person.id), person, msg.chat_id,
+                           datetime.now().isoformat(timespec="seconds"), instruction, [])
+        except planner.PlanError as exc:
+            log.warning("background waits of message %d not planned again: %s", msg.id, exc)
+            self._api.notify(msg.chat_id, i18n.t(person.language, "background_stopped", minutes=round(duration / 60)))
+            return
+        log.info("background waits of message %d ended by the stop, planned again: %s", msg.id, "; ".join(waits))
 
     def _read(
         self,
@@ -288,7 +333,8 @@ class Worker(threading.Thread):
                 watcher.start()
             run_profile = Profile(profile.args + ("--resume", session), profile.cwd, profile.env) if session else profile
             result = self._runner.run(prompt_text, run_profile, on_step=progress.step if progress else None,
-                                      interrupt=interrupt)
+                                      interrupt=interrupt,
+                                      follow_for=self._cfg.claude_background_timeout)
             done.set()
             if watcher:
                 watcher.join()
@@ -362,7 +408,7 @@ class Worker(threading.Thread):
         if reason:
             self._wait_for_claude(conn, msg, reason)
             return
-        self._claude_works(conn)
+        availability.works(conn, self._cfg.data_dir)
         if result.ok and result.text:
             reply, found = directives.extract(result.text, key)
             for term, heard in directives.corrections(found):
@@ -601,31 +647,10 @@ class Worker(threading.Thread):
 
     def _wait_for_claude(self, conn: sqlite3.Connection, msg: store.Message, reason: str) -> None:
         """Claude cannot work at all (logged out, out of usage): the turn goes back to the queue
-        without counting as an attempt, every worker waits a minute before the next try, and the
-        owners hear it once."""
+        without counting as an attempt, and waits with every other turn (``availability``)."""
         store.release(conn, msg.chat_id, keep=msg.id)
         store.requeue(conn, msg.id, counted=False)
-        store.set_state(conn, claude_runner.RETRY_AT, str(time.time() + CLAUDE_RETRY))
-        with _claude_state:
-            told = store.get_state(conn, claude_runner.DOWN)
-            store.set_state(conn, claude_runner.DOWN, reason)
-        if told:
-            return
-        log.error("Claude is unavailable, turns wait: %s", reason)
-        for owner_id, language in access.owner_recipients(conn):
-            self._api.notify(owner_id, i18n.t(language, "claude_down", reason=html.escape(reason)))
-
-    def _claude_works(self, conn: sqlite3.Connection) -> None:
-        """A turn ran: if Claude was unavailable, the owners hear it is back."""
-        with _claude_state:
-            was = store.get_state(conn, claude_runner.DOWN)
-            if was:
-                store.set_state(conn, claude_runner.DOWN, "")
-        if not was:
-            return
-        log.info("Claude works again")
-        for owner_id, language in access.owner_recipients(conn):
-            self._api.notify(owner_id, i18n.t(language, "claude_back"))
+        availability.down(conn, self._cfg.data_dir, reason)
 
     def _retry_or_give_up(self, conn: sqlite3.Connection, person: Person, msg: store.Message, notice: str) -> None:
         store.release(conn, msg.chat_id, keep=msg.id)
@@ -701,7 +726,7 @@ class Worker(threading.Thread):
                 sent_id = self._api.send_message(
                     msg.chat_id, chunk, buttons=buttons, reply_to=None if ids else quoted
                 ).get("message_id")
-            logged = chunk + (f"\n[options: {' | '.join(options)}]" if options and last else "")
+            logged = choices.logged(chunk, options) if options and last else chunk
             store.record_outbound(conn, msg.chat_id, sent_id, logged, person.id, origin)
             ids.append(sent_id)
         if progress:

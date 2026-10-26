@@ -152,7 +152,8 @@ CREATE TABLE IF NOT EXISTS signals (
 CREATE INDEX IF NOT EXISTS idx_signals_person ON signals(person_id, kind, at);
 
 -- Messages programs on the machine ask Zoe to send (zoe-say). The service delivers
--- them and logs them in the chat, so Zoe knows what was said in her name.
+-- them and logs them in the chat, so Zoe knows what was said in her name. options
+-- holds, as JSON, the labels of the buttons under a text message.
 CREATE TABLE IF NOT EXISTS outbox (
     id         INTEGER PRIMARY KEY AUTOINCREMENT,
     chat_id    INTEGER NOT NULL,
@@ -161,6 +162,7 @@ CREATE TABLE IF NOT EXISTS outbox (
     kind       TEXT,
     origin     TEXT,
     silent     INTEGER NOT NULL DEFAULT 0,
+    options    TEXT,
     state      TEXT NOT NULL DEFAULT 'waiting' CHECK (state IN ('waiting', 'sent', 'failed')),
     attempts   INTEGER NOT NULL DEFAULT 0,
     created_at REAL NOT NULL

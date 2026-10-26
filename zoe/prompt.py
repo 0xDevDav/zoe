@@ -60,6 +60,13 @@ _MINDS = (
     "show, and send them when its news arrives."
 )
 
+_WAITING = (
+    "To wait for something that takes minutes or hours (a print, a render, a download), never wait in the "
+    "foreground: start the waiting command in the background and reply right away. Your reply reaches the "
+    "person at once and the chat stays free; when the task ends you are woken in this same session, and what "
+    "you write then reaches them as a new message."
+)
+
 _SELF = (
     "When {name} asks you to learn something or to work differently, or something you do falls short, change "
     "yourself: your self-improvement skill changes your own code or skills through your pipeline, in a parallel "
@@ -103,6 +110,13 @@ RESUMED = (
     "Your previous run of this turn was stopped: it ran too long or went silent. Check what is already "
     "done before doing anything again, and do not repeat what has been done (messages sent, files changed, "
     "orders placed). Then finish the work and reply."
+)
+
+STOPPED_WAITS = (
+    "The service restarted while you waited in the background, after your answer to «{asked}», for:\n{waits}\n"
+    "Those waits were stopped before they ended. Check whether their work is done. Start again in the "
+    "background what is still needed, or tell the person what stopped and what it needs from them. Do not "
+    "repeat what is already done or sent."
 )
 
 _LISTED = 120
@@ -368,6 +382,7 @@ def build(
     parts.append(directives.how(key))
     parts.append(directives.keyed(style.SPOKEN if spoken else style.TELEGRAM, key))
     parts.extend(_plans(conn, person, key))
+    parts.append(_WAITING)
     parts.extend(_minds(conn, person, key))
     if person.role == "owner":
         parts.append(_SELF.format(name=person.name))

@@ -29,7 +29,7 @@ class FakeRunner:
         self.profiles: list[object] = []
 
     def run(self, prompt_text: str, profile: object, on_step: object = None, cancel: object = None,
-            interrupt: object = None) -> Result:
+            interrupt: object = None, follow_for: float = 0.0) -> Result:
         self.prompts.append(prompt_text)
         self.profiles.append(profile)
         reply = self.replies.pop(0)

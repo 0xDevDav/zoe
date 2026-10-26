@@ -5,13 +5,14 @@ import sys
 import tempfile
 import threading
 import time
+from datetime import datetime, timedelta
 from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 
 from fakes import OWNER, FakeAPI, FakeRunner, message, press, shown, targets, worker_setup
-from zoe import access, app, minds, plugins, store
+from zoe import access, app, claude_runner, minds, plugins, store
 from zoe.brain import Brain
 from zoe.claude_runner import Result, Step
 from zoe.db import connect
@@ -135,6 +136,50 @@ def test_a_failed_run_is_resumed_once_and_then_reported():
         conn.close()
 
 
+
+class OutOfUsage:
+    """A run that meets the plan's session limit, which resets two hours from now, then works once it resets."""
+
+    def __init__(self) -> None:
+        reset = datetime.now().astimezone() + timedelta(hours=2)
+        self.limit = f"You've hit your session limit · resets {reset:%I:%M%p}"
+        self.prompts: list[str] = []
+        self.profiles: list[object] = []
+
+    def run(self, prompt_text, profile, on_step=None, cancel=None, interrupt=None, follow_for=0.0) -> Result:
+        self.prompts.append(prompt_text)
+        self.profiles.append(profile)
+        if len(self.prompts) == 1:
+            return Result(False, self.limit, False, False, 1, 0.5, session_id="s-1", failure=self.limit)
+        return Result(True, "Fatto: report pronto.", False, False, 0, 1.0, session_id="s-1")
+
+
+def test_a_mind_that_meets_a_usage_limit_waits_queued_and_resumes_its_session_after():
+    with tempfile.TemporaryDirectory() as tmp:
+        conn, owner, worker, _, api = worker_setup(Path(tmp), on_disk=True)
+        mind_id = minds.start(conn, Brain(conn, owner.id), owner, OWNER, "Report", "Prepara il report", "", [], Path(tmp))
+        runner = OutOfUsage()
+        engine = _engine(worker, runner)
+        _run_mind(conn, engine)
+        mind = minds.get(conn, mind_id)
+        assert (mind.state, mind.session_id, mind.attempts) == ("queued", "s-1", 0)
+        assert store.claim_next(conn) is None
+        assert float(store.get_state(conn, claude_runner.RETRY_AT)) > time.time()
+
+        engine._start(conn)
+        assert engine._working == [] and minds.get(conn, mind_id).state == "queued"
+        notices = [r["text"] for r in conn.execute("SELECT text FROM outbox WHERE chat_id = ?", (OWNER,))]
+        assert len(notices) == 1 and "riprendo alle <b>" in notices[0]
+
+        store.set_state(conn, claude_runner.RETRY_AT, "0")
+        _run_mind(conn, engine)
+        assert "--resume" in runner.profiles[1].args and "s-1" in runner.profiles[1].args
+        assert minds.get(conn, mind_id).state == "done"
+        event = store.claim_next(conn)
+        assert (event.kind, event.payload["event"]) == ("mind", "done")
+        assert not any(t.startswith("🔀") for t in api.to(OWNER))
+        conn.close()
+
 class NoteDuringRun:
     """A run that receives a note while working, then finishes on the resumed session."""
 
@@ -142,7 +187,7 @@ class NoteDuringRun:
         self.home, self.owner_id, self.mind_id = home, owner_id, mind_id
         self.prompts: list[str] = []
 
-    def run(self, prompt_text, profile, on_step=None, cancel=None, interrupt=None) -> Result:
+    def run(self, prompt_text, profile, on_step=None, cancel=None, interrupt=None, follow_for=0.0) -> Result:
         self.prompts.append(prompt_text)
         if len(self.prompts) == 1:
             other = connect(self.home / "zoe.db")
@@ -190,6 +235,12 @@ def test_a_requested_restart_waits_for_turns_and_minds_at_work():
         mind_id = minds.start(conn, Brain(conn, owner.id), owner, OWNER, "Sito", "Crea il sito", "", [], Path(tmp))
         assert not app.at_work(db) and minds.claim(conn) == mind_id and app.at_work(db)
         minds.stop(conn, owner.id, mind_id)
+        assert not app.at_work(db)
+        working, claude_runner.working = claude_runner.working, lambda: 1
+        try:
+            assert app.at_work(db), "a turn's session followed while it works is work too"
+        finally:
+            claude_runner.working = working
         assert not app.at_work(db)
         conn.close()
 
@@ -260,7 +311,7 @@ def test_the_menu_follows_and_stops_minds_for_owners_only():
 class SearchThenFail:
     """A run that searches the web once and then fails."""
 
-    def run(self, prompt_text, profile, on_step=None, cancel=None, interrupt=None) -> Result:
+    def run(self, prompt_text, profile, on_step=None, cancel=None, interrupt=None, follow_for=0.0) -> Result:
         on_step(Step("tool", "WebSearch", {"query": '"accento napoletano" & <dialetto>'}))
         return Result(False, "", False, False, 1, 1.0, session_id="s-1")
 

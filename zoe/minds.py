@@ -31,10 +31,10 @@ from dataclasses import dataclass
 from datetime import datetime
 from pathlib import Path
 
-from . import access, approve, directives, i18n, plugins, store
+from . import access, approve, availability, directives, i18n, plugins, store
 from .access import Person
 from .brain import Brain
-from .claude_runner import ClaudeRunner, Profile, Step
+from .claude_runner import ClaudeRunner, Profile, Step, unavailable
 from .config import Config
 from .db import connect
 from .progress import describe
@@ -319,18 +319,23 @@ class Minds(threading.Thread):
         resumed = reset_running(conn)
         log.info("minds started%s", f", resuming {resumed}" if resumed else "")
         while not self._halt.wait(self._interval):
-            self._working = [t for t in self._working if t.is_alive()]
             try:
-                while len(self._working) < self._cfg.minds and self._room() and (mind_id := claim(conn)) is not None:
-                    thread = threading.Thread(target=self.work, args=(mind_id,), name=f"mind-{mind_id}", daemon=True)
-                    thread.start()
-                    self._working.append(thread)
+                self._start(conn)
             except Exception:
                 log.exception("parallel minds not started")
         for thread in self._working:
             thread.join(timeout=20)
         conn.close()
         log.info("minds stopped")
+
+    def _start(self, conn: sqlite3.Connection) -> None:
+        """Start queued minds while there is room for them and Claude can work."""
+        self._working = [t for t in self._working if t.is_alive()]
+        while (len(self._working) < self._cfg.minds and not availability.waiting(conn) and self._room()
+               and (mind_id := claim(conn)) is not None):
+            thread = threading.Thread(target=self.work, args=(mind_id,), name=f"mind-{mind_id}", daemon=True)
+            thread.start()
+            self._working.append(thread)
 
     def _room(self) -> bool:
         """Whether the system has the memory for one more mind; queued minds wait until it does."""
@@ -394,6 +399,15 @@ class Minds(threading.Thread):
                 if why.get("reason") == "shutdown":
                     conn.execute("UPDATE minds SET state = 'queued' WHERE id = ? AND state = 'running'", (mind_id,))
                 return
+            reason = unavailable(result)
+            if reason:
+                # Claude cannot work at all: the mind waits in the queue with its session and
+                # resumes it once Claude can, without spending its one retry.
+                conn.execute("UPDATE minds SET state = 'queued' WHERE id = ? AND state = 'running'", (mind_id,))
+                availability.down(conn, self._cfg.data_dir, reason)
+                log.warning("parallel mind %d waits for Claude: %s", mind_id, reason)
+                return
+            availability.works(conn, self._cfg.data_dir)
             if result.ok:
                 report, found = directives.extract(result.text, mind.directive_key)
                 question = directives.ask(found)

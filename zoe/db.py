@@ -29,6 +29,7 @@ def connect(path: str | Path) -> sqlite3.Connection:
 _ADDED_COLUMNS = (
     ("minds", "directive_key", "TEXT"),
     ("persons", "folders", "TEXT"),
+    ("outbox", "options", "TEXT"),
 )
 
 

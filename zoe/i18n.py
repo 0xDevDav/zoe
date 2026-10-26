@@ -16,6 +16,7 @@ LANGUAGE_NAME = {"it": "Italian", "en": "English"}
 _CATALOG: dict[str, dict[str, str]] = {
     "it": {
         "stuck_notice": "Mi sono bloccata su un messaggio e l'ho interrotto. Riprovo da sola.",
+        "background_stopped": "Un lavoro che seguivo in background si è fermato senza finire, dopo {minutes} min. Se serve ancora, chiedimi di riprenderlo.",
         "turn_refused": "⚠️ Ho fermato un turno di {name} appena partito: Claude aveva più di quanto spetta a un membro ({what}). Succede se un aggiornamento di Claude Code cambia il significato di un'opzione: controlla la versione prima di riattivare.",
         "receipt_plan": "⏰ In programma: <b>{what}</b>\n{when}",
         "receipt_unplan": "🗑️ Tolto dal programma: {what}",
@@ -35,6 +36,7 @@ _CATALOG: dict[str, dict[str, str]] = {
         "update_lost": "⚠️ Un messaggio che mi è arrivato non sono riuscita a leggerlo, per un errore mio. Se mi hai scritto negli ultimi minuti, rimandamelo.",
         "poll_conflict": "⚠️ Un altro programma sta leggendo i messaggi di questo bot, e alcuni potrebbero non arrivarmi. Succede quando un'altra Zoe o uno script usa lo stesso token.",
         "claude_down": "⚠️ Claude non può lavorare: <i>{reason}</i>\n\nTengo in coda i messaggi e riprovo ogni minuto. Se è il login, rifallo sul server con <code>claude</code> e poi <code>/login</code>.",
+        "claude_limit": "⏸️ Ho raggiunto il limite di utilizzo di Claude: riprendo alle <b>{time}</b>.\n\nI messaggi e le menti al lavoro restano in coda e ripartono da soli da dove erano.",
         "claude_back": "✅ Claude funziona di nuovo: riprendo i messaggi in coda.",
         "error_notice": "Qualcosa è andato storto mentre rispondevo e non sono riuscita a rimediare. Riscrivimi.",
         "given_up": "Non sono riuscita a rispondere a questo messaggio dopo più tentativi. L'ho segnato e vado avanti.",
@@ -223,6 +225,7 @@ _CATALOG: dict[str, dict[str, str]] = {
     },
     "en": {
         "stuck_notice": "I got stuck on a message and stopped it. I'll retry on my own.",
+        "background_stopped": "Something I was following in the background stopped before it finished, after {minutes} min. If it is still needed, ask me to pick it up again.",
         "turn_refused": "⚠️ I stopped a turn of {name} as it started: Claude had more than a member may use ({what}). It happens when a Claude Code update changes what an option means: check the version before going on.",
         "receipt_plan": "⏰ Scheduled: <b>{what}</b>\n{when}",
         "receipt_unplan": "🗑️ Removed from the schedule: {what}",
@@ -242,6 +245,7 @@ _CATALOG: dict[str, dict[str, str]] = {
         "update_lost": "⚠️ A message reached me but I could not read it, because of an error on my side. If you wrote to me in the last few minutes, please send it again.",
         "poll_conflict": "⚠️ Another program is reading this bot's messages, so some may not reach me. It happens when another Zoe or a script uses the same token.",
         "claude_down": "⚠️ Claude cannot work: <i>{reason}</i>\n\nI keep the messages queued and try again every minute. If it is the login, redo it on the server with <code>claude</code> and then <code>/login</code>.",
+        "claude_limit": "⏸️ Claude's usage limit is reached: I resume at <b>{time}</b>.\n\nMessages and minds at work stay queued and pick up by themselves where they were.",
         "claude_back": "✅ Claude works again: I am picking up the queued messages.",
         "error_notice": "Something went wrong while I was answering and I couldn't recover. Please message me again.",
         "given_up": "I couldn't answer this message after several tries. I've logged it and I'm moving on.",

@@ -39,6 +39,16 @@ def attach(conn: sqlite3.Connection, choice_id: int, telegram_id: int | None) ->
     conn.execute("UPDATE choices SET telegram_id = ? WHERE id = ?", (telegram_id, choice_id))
 
 
+def discard(conn: sqlite3.Connection, choice_id: int) -> None:
+    """Forget a choice whose question was never sent."""
+    conn.execute("DELETE FROM choices WHERE id = ?", (choice_id,))
+
+
+def logged(text: str, options: list[str]) -> str:
+    """The text of a question as the chat history keeps it, with the options it offered."""
+    return f"{text}\n[options: {' | '.join(options)}]"
+
+
 def resolve(conn: sqlite3.Connection, choice_id: int, index: int, person_id: int) -> str | None:
     """Record the tapped option and return its label, or None if the choice is not open to this person."""
     row = conn.execute(

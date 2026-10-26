@@ -42,8 +42,9 @@ CONNECT_TIMEOUT = 4.0
 # and a request sent on it would wait its whole timeout before it is tried again.
 IDLE_LIMIT = 60.0
 
-# Reactions Zoe uses: a friendly subset of the ones Telegram accepts from bots.
-REACTIONS = frozenset(
+# Reactions Zoe uses, the same list her instructions offer: a friendly subset of the emoji
+# Telegram accepts from bots (ReactionTypeEmoji), written without variation selectors.
+REACTIONS = tuple(
     "👍 ❤ 🔥 🥰 👏 😁 🤔 🤯 😱 😢 🎉 🤩 🙏 👌 😍 💯 🤣 ⚡ 🏆 💔 🤨 😐 😴 😭 🤓 👀 🙈 😇 🤝 ✍ 🤗 🫡 😘 😎".split()
 )
 

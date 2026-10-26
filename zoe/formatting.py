@@ -7,7 +7,7 @@ mechanical rules of ``style`` to every reply:
 - Markdown emphasis, code, links, headings, quotes, lists and tables become
   Telegram HTML, titles and lists;
 - the long dash and the en dash are replaced;
-- an emoji in the middle of a line ends that line, except in section titles;
+- an emoji that ends a sentence ends its line, except in section titles;
 - a section title gets a blank line before it, and so does a paragraph after a list.
 
 The result is always valid for Telegram's HTML parse mode.
@@ -29,6 +29,8 @@ EMOJI = re.compile(
     f"(?:[\U0001f1e6-\U0001f1ff]{{2}}|[{_EMOJI_CHARS}]){_EMOJI_TAIL}(?:‍[{_EMOJI_CHARS}]{_EMOJI_TAIL})*"
 )
 _EMOJI_CLUSTER = re.compile(f"(?:{EMOJI.pattern})(?:[ \t]*(?:{EMOJI.pattern}))*")
+
+_MID_SENTENCE = ",.;:!?)]}»…"
 
 _HELD = re.compile(r"\x00(\d+)\x00")
 _MARKUP = re.compile(r"<[^<>]+>|\x00\d+\x00")
@@ -160,17 +162,22 @@ def _dashes(text: str) -> str:
     return re.sub(r"[—–]", "-", text)
 
 
-def _break_after_emoji(line: str) -> str:
-    """End the line after an emoji that has more text after it, unless it opens the line."""
+def _break_after_emoji(line: str) -> list[str]:
+    """Split the line after each emoji that ends a sentence, unless the emoji opens the line.
+
+    An emoji followed by a lowercase letter or by punctuation sits inside its sentence and stays.
+    """
     for match in _EMOJI_CLUSTER.finditer(line):
         if _visible(line[: match.start()]).strip() in ("", "•"):
             continue
         rest = line[match.end():]
         closing = re.match(r"(?:\s*</[^<>]+>)*", rest).group(0)
         after = rest[len(closing):]
-        if re.search(r"\w", _visible(after)):
-            return line[: match.end()] + closing + "\n" + _break_after_emoji(after.lstrip())
-    return line
+        following = _visible(after).lstrip()
+        if not re.search(r"\w", following) or following[0].islower() or following[0] in _MID_SENTENCE:
+            continue
+        return [line[: match.end()] + closing, *_break_after_emoji(after.lstrip())]
+    return [line]
 
 
 def _is_bullet(line: str) -> bool:
@@ -184,13 +191,20 @@ def _is_title(line: str) -> bool:
     return bool(EMOJI.match(stripped[3:])) or (stripped.endswith("</b>") and "</b>" not in stripped[:-4])
 
 
-def _space_blocks(text: str) -> str:
+def _space_blocks(lines: list[list[str]]) -> str:
+    """Join lines, each given with the pieces it was split into, adding a blank line between blocks.
+
+    The pieces of one line stay together, so a bullet split after an emoji remains one item.
+    """
     out: list[str] = []
-    for line in text.split("\n"):
-        if out and out[-1].strip() and line.strip():
-            if _is_title(line) or (_is_bullet(out[-1]) and not _is_bullet(line)):
+    previous = ""
+    for pieces in lines:
+        head = pieces[0]
+        if out and out[-1].strip() and head.strip():
+            if _is_title(head) or (_is_bullet(previous) and not _is_bullet(head)):
                 out.append("")
-        out.append(line)
+        out.extend(pieces)
+        previous = head
     return re.sub(r"\n{3,}", "\n\n", "\n".join(out))
 
 
@@ -226,8 +240,7 @@ def to_telegram(text: str) -> str:
     text = held.restore(text, late=False)
     text = _inline(_lines(_tables(text)), held)
     text = _dashes(text)
-    text = "\n".join(_break_after_emoji(line) for line in text.split("\n"))
-    text = _space_blocks(text)
+    text = _space_blocks([_break_after_emoji(line) for line in text.split("\n")])
     text = held.restore(text, late=True).strip()
     return text if _balanced(text) else _strip_tags(text)
 

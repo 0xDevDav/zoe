@@ -1,20 +1,24 @@
 """Checks for a turn's messages: their Telegram numbers, quoting, replies, and messages written during a turn."""
 
+import dataclasses
 import re
 import sys
 import tempfile
 import threading
 import time
+from datetime import datetime, timedelta
 from pathlib import Path
+from zoneinfo import ZoneInfo
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 
 from fakes import OWNER, button_data, message, press, worker_setup
-from zoe import access, formatting, prompt, store
+from test_runner import _claude
+from zoe import access, app, availability, claude_runner, formatting, i18n, planner, prompt, say, store
 from zoe import worker as worker_module
 from zoe.brain import Brain, Recalled
-from zoe.claude_runner import Result
+from zoe.claude_runner import ClaudeRunner, Result
 from zoe.ingest import Poller
 from zoe.telegram import TelegramError
 
@@ -168,7 +172,7 @@ class LoggedOut:
     def __init__(self, failing: int) -> None:
         self.failing, self.runs = failing, 0
 
-    def run(self, prompt_text, profile, on_step=None, cancel=None, interrupt=None) -> Result:
+    def run(self, prompt_text, profile, on_step=None, cancel=None, interrupt=None, follow_for=0.0) -> Result:
         self.runs += 1
         if self.runs <= self.failing:
             return Result(False, "", False, False, 1, 0.1, failure="Not logged in · Please run /login")
@@ -185,6 +189,7 @@ def test_while_claude_cannot_work_turns_wait_and_the_owner_hears_it_once_and_whe
             assert msg.id == 1 and msg.attempts == 1
             worker._handle(conn, msg)
         assert float(store.get_state(conn, "claude_retry_at")) > time.time()
+        say.deliver(conn, api)
         down = [t for t in api.to(OWNER) if "Claude non può lavorare" in t]
         assert len(down) == 1 and "Not logged in" in down[0]
         assert sum("Claude funziona di nuovo" in t for t in api.to(OWNER)) == 1 and "Eccomi" in api.to(OWNER)
@@ -192,6 +197,53 @@ def test_while_claude_cannot_work_turns_wait_and_the_owner_hears_it_once_and_whe
 
     written = Result(False, "L'API di Grafana dice: rate limit reached", False, False, 1, 3.0)
     assert worker_module.unavailable(written) == ""
+
+
+LIMIT = "You've hit your session limit · resets 6pm (Europe/Rome)"
+
+
+class OutOfUsage:
+    """Claude has reached the plan's session limit, which resets two hours from now."""
+
+    def __init__(self) -> None:
+        reset = datetime.now().astimezone() + timedelta(hours=2)
+        self.limit = f"You've hit your session limit · resets {reset:%I:%M%p}"
+
+    def run(self, prompt_text, profile, on_step=None, cancel=None, interrupt=None, follow_for=0.0) -> Result:
+        return Result(False, self.limit, False, False, 1, 0.1, session_id="s-1", failure=self.limit)
+
+
+def test_a_usage_limit_holds_the_turns_until_it_resets_and_says_when_once():
+    assert worker_module.unavailable(Result(False, "", False, False, 1, 0.1, failure=LIMIT)) == LIMIT
+    rome = ZoneInfo("Europe/Rome")
+    afternoon = datetime(2026, 10, 22, 17, 31, tzinfo=rome)
+    assert availability.resumes_at(LIMIT, afternoon) == datetime(2026, 10, 22, 18, 0, tzinfo=rome).timestamp()
+    assert availability.resumes_at(LIMIT, afternoon.replace(hour=18, second=30)) == afternoon.replace(
+        hour=18, minute=0).timestamp()
+    night = "You've hit your session limit · resets 3am (Europe/Rome)"
+    assert availability.resumes_at(night, afternoon) == datetime(2026, 10, 23, 3, 0, tzinfo=rome).timestamp()
+    assert availability.resumes_at("Not logged in · Please run /login", afternoon) is None
+
+    with tempfile.TemporaryDirectory() as tmp:
+        conn, owner, worker, _, api = worker_setup(Path(tmp))
+        worker._runner = limited = OutOfUsage()
+        store.record_inbound(conn, message(5, OWNER, "guarda le icone"), owner.id)
+        store.record_inbound(conn, message(6, OWNER, "e questa?"), owner.id)
+        msg = store.claim_next(conn)
+        worker._handle(conn, msg)
+        row = conn.execute("SELECT state, attempts FROM messages WHERE id = ?", (msg.id,)).fetchone()
+        assert (row["state"], row["attempts"]) == ("received", 0)
+        assert availability.waiting(conn)
+        resume = availability.resumes_at(limited.limit)
+        assert float(store.get_state(conn, "claude_retry_at")) == resume and resume > time.time() + 7000
+        again = store.claim_next(conn)
+        assert again.id == msg.id and again.attempts == 1
+        worker._handle(conn, again)
+        say.deliver(conn, api)
+        told = [t for t in api.to(OWNER) if "limite" in t]
+        assert len(told) == 1 and f"riprendo alle <b>{datetime.fromtimestamp(resume):%H:%M}" in told[0]
+        assert not any("non ho potuto" in t.lower() or "Claude non può lavorare" in t for t in api.to(OWNER))
+        assert conn.execute("SELECT COUNT(*) FROM messages WHERE state = 'failed'").fetchone()[0] == 0
 
 
 def test_a_reply_to_a_message_brings_its_text_and_time():
@@ -225,7 +277,7 @@ class WritesDuringTheTurn:
         self.conn, self.person_id = conn, person_id
         self.prompts, self.profiles = [], []
 
-    def run(self, prompt_text, profile, on_step=None, cancel=None, interrupt=None) -> Result:
+    def run(self, prompt_text, profile, on_step=None, cancel=None, interrupt=None, follow_for=0.0) -> Result:
         self.prompts.append(prompt_text)
         self.profiles.append(profile)
         if len(self.prompts) == 1:
@@ -267,7 +319,7 @@ class StuckThenDone:
     def __init__(self) -> None:
         self.prompts, self.profiles = [], []
 
-    def run(self, prompt_text, profile, on_step=None, cancel=None, interrupt=None) -> Result:
+    def run(self, prompt_text, profile, on_step=None, cancel=None, interrupt=None, follow_for=0.0) -> Result:
         self.prompts.append(prompt_text)
         self.profiles.append(profile)
         if len(self.prompts) == 1:
@@ -293,7 +345,7 @@ class StuckThenSends:
     def __init__(self, video: Path) -> None:
         self.video, self.prompts = video, []
 
-    def run(self, prompt_text, profile, on_step=None, cancel=None, interrupt=None) -> Result:
+    def run(self, prompt_text, profile, on_step=None, cancel=None, interrupt=None, follow_for=0.0) -> Result:
         self.prompts.append(prompt_text)
         if len(self.prompts) == 1:
             self.key = re.search(r"Your key for this turn is (\w+)\.", prompt_text).group(1)
@@ -333,6 +385,155 @@ def test_a_reply_that_could_not_be_delivered_is_delivered_again_without_a_new_tu
             worker._recover(conn, claimed)
         worker._handle(conn, store.claim_next(conn))
         assert len(runner.prompts) == 1 and api.to(OWNER)[-1] == "Prenotato 🍝"
+
+
+class AnswersThenWaits:
+    """A turn that answers while its background wait runs and speaks again when the wait ends;
+    any later turn answers plainly."""
+
+    def __init__(self) -> None:
+        self.ended = threading.Event()
+        self.profiles: list = []
+
+    def run(self, prompt_text: str, profile, on_step: object = None, cancel: object = None,
+            interrupt: object = None, follow_for: float = 0.0) -> Result:
+        self.profiles.append(profile)
+        if len(self.profiles) > 1:
+            return Result(True, "Sì, il pane è in forno", False, False, 0, 1.0, session_id="s-4")
+        key = re.search(r"Your key for this turn is (\w+)\.", prompt_text).group(1)
+        ended = self.ended
+
+        class Later:
+            def answers(self, cancel=None):
+                ended.wait(5)
+                yield Result(True, f"Il pane è pronto 🍞\n[[{key} react: 👍]]", False, False, 0, 9.0)
+
+        assert follow_for > 0
+        return Result(True, "Lo metto in forno, ti scrivo quando è pronto", False, False, None, 1.0,
+                      session_id="s-3", later=Later())
+
+
+def _done(conn) -> None:
+    """Let the threads that follow background work end, then close the chat's database."""
+    for follower in threading.enumerate():
+        if "-later-" in follower.name:
+            follower.join(5)
+    conn.close()
+
+
+def test_a_turn_answers_at_once_while_its_wait_runs_and_tells_when_it_ends():
+    with tempfile.TemporaryDirectory() as tmp:
+        conn, owner, worker, _, api = worker_setup(Path(tmp), on_disk=True)
+        worker._runner = runner = AnswersThenWaits()
+        store.record_inbound(conn, message(5, OWNER, "cuoci il pane"), owner.id)
+        worker._handle(conn, store.claim_next(conn))
+        assert api.to(OWNER)[-1] == "Lo metto in forno, ti scrivo quando è pronto"
+        _say(conn, worker, owner, 6, "ci sei?")
+        assert api.to(OWNER)[-1] == "Sì, il pane è in forno"
+        assert "--resume" not in runner.profiles[-1].args
+        runner.ended.set()
+        deadline = time.monotonic() + 5
+        while api.to(OWNER)[-1] != "Il pane è pronto 🍞" and time.monotonic() < deadline:
+            time.sleep(0.05)
+        assert api.to(OWNER)[-1] == "Il pane è pronto 🍞"
+        assert [r["state"] for r in conn.execute("SELECT state FROM messages WHERE direction = 'in'")] == \
+            ["answered", "answered"]
+        assert api.reactions[-1][2] == "👍"
+        episodes = [r.content for r in Brain(conn, owner.id).top("episode")]
+        assert any("Alex: cuoci il pane" in e and "Zoe: Il pane è pronto" in e for e in episodes)
+        assert not any("answer" in (r["payload"] or "")
+                       for r in conn.execute("SELECT payload FROM messages WHERE direction = 'in'"))
+        _done(conn)
+
+
+def test_background_work_stopped_before_it_ends_is_told_to_the_person():
+    with tempfile.TemporaryDirectory() as tmp:
+        conn, owner, worker, _, api = worker_setup(Path(tmp), on_disk=True)
+
+        class Later:
+            def answers(self, cancel=None):
+                yield Result(False, "", True, False, None, 14400.0)
+
+        class StartsAWait:
+            def run(self, prompt_text, profile, on_step=None, cancel=None, interrupt=None, follow_for=0.0):
+                return Result(True, "Avvio il download", False, False, None, 1.0, session_id="s-5", later=Later())
+
+        worker._runner = StartsAWait()
+        store.record_inbound(conn, message(5, OWNER, "scarica il film"), owner.id)
+        worker._handle(conn, store.claim_next(conn))
+        deadline = time.monotonic() + 5
+        while len(api.to(OWNER)) < 2 and time.monotonic() < deadline:
+            time.sleep(0.05)
+        assert api.to(OWNER) == ["Avvio il download", i18n.t("it", "background_stopped", minutes=240)]
+        _done(conn)
+
+
+# A turn that answers while its long render runs in the background; with "busy" it then goes
+# back to work in the foreground instead of waiting.
+RENDER_CLAUDE = r'''
+import json, sys, time
+def say(event):
+    print(json.dumps(event), flush=True)
+sys.stdin.read()
+say({"type": "system", "subtype": "init", "session_id": "s-9", "tools": []})
+say({"type": "assistant", "message": {"content": [{"type": "tool_use", "id": "t1", "name": "Bash", "input": {
+    "command": "sleep 600; render --final", "description": "Render del video", "run_in_background": True}}]}})
+say({"type": "system", "subtype": "background_tasks_changed", "tasks": [{"task_id": "b9", "description": "Render del video"}]})
+say({"type": "user", "message": {"content": [{"type": "tool_result", "tool_use_id": "t1"}]},
+     "tool_use_result": {"backgroundTaskId": "b9"}})
+say({"type": "result", "result": "Avvio il render, ti scrivo quando è pronto", "is_error": False})
+if sys.argv[-1] == "busy":
+    time.sleep(0.5)
+    say({"type": "assistant", "message": {"content": [{"type": "tool_use", "id": "t2", "name": "Bash",
+                                                       "input": {"command": "make video"}}]}})
+time.sleep(600)
+'''
+
+
+def _start_render(tmp: Path, mode: str):
+    conn, owner, worker, _, api = worker_setup(tmp, on_disk=True)
+    runner = ClaudeRunner(_claude(tmp, RENDER_CLAUDE), "model", hard_timeout=900, inactivity_timeout=20)
+    runner.run = _with_arg(runner.run, mode)
+    worker._runner = runner
+    store.record_inbound(conn, message(5, OWNER, "fai il video"), owner.id)
+    msg = store.claim_next(conn)
+    started = time.monotonic()
+    worker._handle(conn, msg)
+    assert time.monotonic() - started < 5 and api.to(OWNER) == ["Avvio il render, ti scrivo quando è pronto"]
+    return conn, owner, worker, api
+
+
+def _with_arg(run, arg: str):
+    """Pass ``arg`` to the stand-in Claude as its last argument."""
+    def wrapped(prompt_text, profile, **kwargs):
+        return run(prompt_text, dataclasses.replace(profile, args=(*profile.args, arg)), **kwargs)
+    return wrapped
+
+
+def test_a_restart_goes_past_a_turn_that_only_waits_and_plans_to_take_the_wait_up_again():
+    with tempfile.TemporaryDirectory() as tmp:
+        conn, owner, worker, api = _start_render(Path(tmp), "waits")
+        time.sleep(1.5)
+        assert claude_runner.following() == 1 and not app.at_work(Path(tmp) / "zoe.db"), \
+            "a session that only waits for its background task holds no restart"
+        started = time.monotonic()
+        worker._halt.set()
+        assert claude_runner.settle(20) and time.monotonic() - started < 15
+        [plan] = planner.pending(conn, owner.id)
+        assert "Render del video | sleep 600; render --final" in plan.instruction
+        assert "fai il video" in plan.instruction and plan.due_at <= time.time()
+        assert api.to(OWNER) == ["Avvio il render, ti scrivo quando è pronto"], "no notice of a stop"
+        conn.close()
+
+
+def test_a_restart_waits_for_a_followed_session_that_works_again():
+    with tempfile.TemporaryDirectory() as tmp:
+        conn, owner, worker, api = _start_render(Path(tmp), "busy")
+        time.sleep(1.5)
+        assert app.at_work(Path(tmp) / "zoe.db"), "a session running a command is waited for"
+        worker._halt.set()
+        assert claude_runner.settle(20)
+        conn.close()
 
 
 def test_the_owner_admits_someone_by_id_through_zoe():

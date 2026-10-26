@@ -455,10 +455,25 @@ only in instructions:
   command runs (a build, an install) is work, not a stuck turn, for up to 20
   minutes. A reply whose delivery failed is delivered again on the next try
   without running Claude again, and due plans are queued in one transaction.
+- **A wait never holds the chat.** A turn that answers while its background
+  tasks still run (a print, a render, a download) sends that answer at once and
+  frees the chat; its session is followed on, silent for as long as the tasks
+  run, up to `ZOE_CLAUDE_BACKGROUND_TIMEOUT` (four hours), and what Claude says
+  when they end reaches the person as a further reply. A requested restart
+  waits for such a session only while it replies or runs a command: one that
+  only waits for its tasks is ended by the stop, and a plan due at once, with
+  what it waited for and the commands behind it, takes the waits up again after
+  the start. A command left in the foreground
+  holds the turn for two minutes at most: Claude Code then moves it to the
+  background, where it is followed the same way.
 - **When Claude cannot work at all** (logged out, out of usage), which its own
   error says, never what a turn wrote: turns go back to the queue without
-  counting as attempts, every worker waits a minute between tries, and the
-  owners hear it once with the reason, then again when Claude is back.
+  counting as attempts, and working parallel minds go back to theirs with
+  their session, without spending their retry. Nothing starts again before
+  the retry moment: when a usage limit resets, as its error says ("resets
+  6pm"), otherwise a minute later. The owners hear it once, with the time
+  Zoe resumes or the reason, then again when Claude is back
+  (`availability.py`).
 - **Long messages cannot flood the memory:** a message teaches the speech
   glossary at most 15 words, pasted code and logs none.
 
@@ -536,7 +551,12 @@ echo "text" | zoe-say -                      # text from stdin
 zoe-say --file report.pdf "caption"          # a file
 zoe-say --file note.ogg --kind voice         # a voice note
 zoe-say --silent "text"                      # without a notification sound
+zoe-say --options "Yes|No" "text"            # with one button per option
 ```
+
+With `--options` (up to eight labels, text messages only) the buttons sit under
+the last part of the message, as with the choices Zoe offers herself: a tap
+reaches Zoe as the person's next message, as if they had written the label.
 
 Coming from claude-telegram-supercharged, `tools/import_supercharged.py`
 brings its chat history and speech glossary in.
@@ -697,6 +717,7 @@ for t in tests/test_*.py; do python "$t"; done
 | `review.py` | the nightly review: what was learned, completed, merged, corrected and pruned |
 | `improve.py` | the nightly study: proposals to improve Zoe, decided in the menu and made by a parallel mind |
 | `approve.py` | the owner's yes on Telegram before an action their rules mark as asking |
+| `availability.py` | whether Claude can work at all: turns and minds wait for a usage limit to reset, owners hear it once |
 | `usage.py` | Claude's usage limits, read from `/usage` in the background for the menu |
 | `signals.py` | readings about a person over time: moods, and later devices |
 | `telegram.py` | Telegram Bot API client |

@@ -117,7 +117,7 @@ class AsksDuringTheTurn:
     def __init__(self, conn, api) -> None:
         self.conn, self.api = conn, api
 
-    def run(self, prompt_text, profile, on_step=None, cancel=None, interrupt=None):
+    def run(self, prompt_text, profile, on_step=None, cancel=None, interrupt=None, follow_for=0.0):
         self.api.send_message(OWNER, "🔐 Posso farlo?")
         self.conn.execute("INSERT INTO approvals (chat_id, tool, args, created_at, message_id) VALUES (?, 'Bash', '{}', ?, ?)",
                           (OWNER, time.time(), self.api.sent_ids[-1]))

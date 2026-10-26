@@ -11,7 +11,7 @@ import threading
 import time
 from pathlib import Path
 
-from . import access, bot_setup, health, i18n, instance, meaning, notices, plugins, store
+from . import access, bot_setup, claude_runner, health, i18n, instance, meaning, notices, plugins, store
 from .brain import Brain
 from .config import Config
 from .db import apply_schema, connect
@@ -34,9 +34,18 @@ log = logging.getLogger("zoe")
 _BEAT_EVERY = 5.0
 
 
+# Seconds a stop waits for the sessions it set aside to end and be noted.
+_SETTLE = 60.0
+
+
 def at_work(db_path: Path) -> bool:
-    """Whether a turn is waiting or running, or a parallel mind is working. A requested restart
-    waits for them, so it never cuts work short."""
+    """Whether a turn is waiting or running, a session followed after its answer is replying or
+    running a command, or a parallel mind is working. A requested restart waits for them, so it
+    never cuts work short. A followed session that only waits for its background tasks is not
+    waited for: the stop ends it and plans its resumption. The service's own loop asks, so the
+    sessions it follows are counted in memory."""
+    if claude_runner.working():
+        return True
     conn = connect(db_path)
     try:
         return bool(conn.execute(
@@ -162,6 +171,8 @@ def main() -> None:
 
     for thread in threads:
         thread.join(timeout=cfg.claude_timeout + 60 if restarting else 10)
+    if not claude_runner.settle(_SETTLE):
+        log.warning("%d background wait(s) not noted before stopping", claude_runner.following())
     if restarting:
         restart_request.unlink(missing_ok=True)
         sys.exit(RESTART)

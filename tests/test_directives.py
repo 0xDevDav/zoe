@@ -5,11 +5,11 @@ from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
-from zoe import directives
+from zoe import directives, style
 from zoe.directives import (
     MAX_OPTIONS, ask, corrections, forwards, minds, options, plans, quote, reaction, skip, stops, tells, unplans,
 )
-from zoe.telegram import TelegramAPI
+from zoe.telegram import REACTIONS, TelegramAPI
 
 KEY = "a1b2c3"
 
@@ -155,6 +155,20 @@ def test_reactions_stay_within_the_supported_set():
     assert api.react(1, 2, "🦖") == "👍"
     method, params = api.calls[0]
     assert method == "setMessageReaction" and params["reaction"] == [{"type": "emoji", "emoji": "❤"}]
+
+
+def test_the_instructions_offer_exactly_the_reactions_telegram_is_sent():
+    # The emoji Telegram's Bot API accepts as ReactionTypeEmoji, without variation selectors.
+    accepted = set(
+        "❤ 👍 👎 🔥 🥰 👏 😁 🤔 🤯 😱 🤬 😢 🎉 🤩 🤮 💩 🙏 👌 🕊 🤡 🥱 🥴 😍 🐳 ❤\u200d🔥 🌚 🌭 💯 🤣 ⚡ 🍌 🏆 💔 🤨 😐 🍓 "
+        "🍾 💋 🖕 😈 😴 😭 🤓 👻 👨\u200d💻 👀 🎃 🙈 😇 😨 🤝 ✍ 🤗 🫡 🎅 🎄 ☃ 💅 🤪 🗿 🆒 💘 🙉 🦄 😘 💊 🙊 😎 👾 "
+        "🤷\u200d♂ 🤷 🤷\u200d♀ 😡".split()
+    )
+    assert set(REACTIONS) <= accepted and {"😴", "🥰", "🤗", "😘", "🫡"} <= set(REACTIONS)
+    offered = style.TELEGRAM.split("Pick one from: ", 1)[1].split(".", 1)[0].split()
+    assert offered == list(REACTIONS)
+    api = RecordingAPI()
+    assert all(api.react(1, 2, emoji) == emoji for emoji in offered)
 
 
 def _run() -> None:

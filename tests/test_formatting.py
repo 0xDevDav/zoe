@@ -34,10 +34,23 @@ def test_long_and_en_dashes_are_replaced():
     assert to_telegram("dalle 14:00–20:00") == "dalle 14:00-20:00"
 
 
-def test_emoji_in_the_middle_of_a_line_ends_it():
-    assert to_telegram("Fatto ✅ Il tasto non c'è più.") == "Fatto ✅\nIl tasto non c'è più."
-    assert to_telegram("<b>Pronto 👍</b> ti mando il file") == "<b>Pronto 👍</b>\nti mando il file"
+def test_emoji_ending_a_sentence_ends_its_line():
+    assert to_telegram("Fatto ✅ Il tasto Disconnect non c'è più.") == "Fatto ✅\nIl tasto Disconnect non c'è più."
+    assert to_telegram("<b>Pronto 👍</b> Ti mando il file") == "<b>Pronto 👍</b>\nTi mando il file"
     assert to_telegram("Spedito 📦.") == "Spedito 📦."
+
+
+def test_emoji_inside_a_sentence_stays_in_place():
+    line = "• Per il tuo \"Ciao\" ho messo la reazione 😴, che Telegram accetta"
+    assert to_telegram(line + "\n• Altro punto") == line + "\n• Altro punto"
+    assert to_telegram("Wait, 😴 isn't in the list.") == "Wait, 😴 isn't in the list."
+    assert to_telegram("Mia ha scritto 👍 e poi è uscita") == "Mia ha scritto 👍 e poi è uscita"
+
+
+def test_a_bullet_split_after_an_emoji_stays_one_item():
+    text = "• Ordine spedito 📦 Arriva domani.\n• Fattura pronta"
+    assert to_telegram(text) == "• Ordine spedito 📦\nArriva domani.\n• Fattura pronta"
+    assert to_telegram("• Pagato ✅ Grazie Mia\nAltro paragrafo") == "• Pagato ✅\nGrazie Mia\n\nAltro paragrafo"
 
 
 def test_emoji_opening_a_title_or_bullet_stays():
@@ -70,7 +83,7 @@ def test_split_respects_the_limit_at_block_boundaries():
 
 
 def test_plain_text_for_speech():
-    assert to_plain("**Fatto** ✅ il file è <code>pronto</code>") == "Fatto\nil file è pronto"
+    assert to_plain("**Fatto** ✅ Il file è <code>pronto</code>") == "Fatto\nIl file è pronto"
 
 
 def _run() -> None:

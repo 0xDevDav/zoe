@@ -67,6 +67,7 @@ class Config:
     claude_model: str = "claude-opus-5-5"
     claude_timeout: float = 1800.0
     claude_inactivity_timeout: float = 240.0
+    claude_background_timeout: float = 14400.0
     max_attempts: int = 2
     observer_model: str = "claude-sonnet-5-5"
     observer_idle: float = 600.0
@@ -114,6 +115,7 @@ class Config:
             claude_model=env("ZOE_CLAUDE_MODEL", "claude-opus-5-5"),
             claude_timeout=float(env("ZOE_CLAUDE_TIMEOUT", "1800")),
             claude_inactivity_timeout=float(env("ZOE_CLAUDE_INACTIVITY_TIMEOUT", "240")),
+            claude_background_timeout=float(env("ZOE_CLAUDE_BACKGROUND_TIMEOUT", "14400")),
             max_attempts=int(env("ZOE_MAX_ATTEMPTS", "2")),
             observer_model=env("ZOE_OBSERVER_MODEL", "claude-sonnet-5-5"),
             observer_idle=float(env("ZOE_OBSERVER_IDLE", "600")),
