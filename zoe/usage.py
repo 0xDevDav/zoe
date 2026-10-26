@@ -1,9 +1,11 @@
-"""The plan's usage limits as Claude Code's /usage reports them: the 5-hour session and the
-weekly limits, each with how much is used and when it resets.
+"""The plan's usage limits: the 5-hour session and the week, each with how much is used and
+when it resets.
 
-``claude -p /usage`` answers on its own, without a model call, in a few seconds. So the
-menu never waits for it: a reading runs in the background when someone looks and the
-last one is older than FRESH, and the menu shows the last reading meanwhile.
+Every Claude run reports them along with its requests, so the menu shows what the latest
+run reported. When nothing newer than FRESH is known, as after a start or while a long
+parallel mind works alone, it also asks ``claude -p /usage``, which answers on its own,
+without a model call, in a few seconds: a reading runs in the background when someone
+looks, at most once every FRESH, and the menu shows the newest of the two meanwhile.
 """
 
 from __future__ import annotations
@@ -20,6 +22,7 @@ from datetime import datetime, timedelta
 from pathlib import Path
 from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 
+from . import claude_runner
 from .claude_runner import _inherited
 from .config import Config
 
@@ -40,6 +43,26 @@ class Limit:
     label: str
     used: float
     resets_at: float | None
+
+
+# The windows a run reports, by the labels /usage gives them.
+_WINDOWS = (("five_hour", "Current session"), ("seven_day", "Current week (all models)"))
+
+
+def from_report(info: dict, now: float) -> list[Limit]:
+    """The limits a run reported with its request; a window past its reset is unused again."""
+    windows = info.get("unifiedWindows") if isinstance(info.get("unifiedWindows"), dict) else {}
+    limits = []
+    for key, label in _WINDOWS:
+        window = windows.get(key)
+        if not isinstance(window, dict) or not isinstance(window.get("utilization"), (int, float)):
+            continue
+        resets = window.get("resetsAt") if isinstance(window.get("resetsAt"), (int, float)) else None
+        if resets is not None and resets <= now:
+            limits.append(Limit(label, 0.0, None))
+        else:
+            limits.append(Limit(label, round(window["utilization"] * 100, 1), resets))
+    return limits
 
 
 def resets_at(text: str, now: datetime) -> float | None:
@@ -102,15 +125,26 @@ class Usage:
         self._read_now = reader or (lambda: read(cfg.claude_bin, cfg.data_dir))
         self._lock = threading.Lock()
         self._limits: list[Limit] = []
+        self._limits_at = 0.0
         self._read_at = 0.0
         self._reading = False
 
     def latest(self) -> list[Limit]:
+        """The session and the week, from the latest run's report or from /usage, whichever is
+        newer; /usage is read again in the background when that is older than FRESH."""
+        now = time.time()
+        info, at = claude_runner.reported()
+        reported = from_report(info, now)
+        windows = {label for _, label in _WINDOWS}
         with self._lock:
-            if not self._reading and time.time() - self._read_at > FRESH:
+            if reported and at >= self._limits_at:
+                newest, since = reported, at
+            else:
+                newest, since = [limit for limit in self._limits if limit.label in windows], self._limits_at
+            if now - since > FRESH and not self._reading and now - self._read_at > FRESH:
                 self._reading = True
                 threading.Thread(target=self._refresh, name="usage", daemon=True).start()
-            return self._limits
+            return newest
 
     def _refresh(self) -> None:
         try:
@@ -121,4 +155,4 @@ class Usage:
         with self._lock:
             self._reading, self._read_at = False, time.time()
             if limits is not None:
-                self._limits = limits
+                self._limits, self._limits_at = limits, time.time()

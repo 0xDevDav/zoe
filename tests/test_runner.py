@@ -11,6 +11,7 @@ from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
+from zoe import claude_runner
 from zoe.claude_runner import ClaudeRunner, Profile, following
 
 FAKE_CLAUDE = r'''
@@ -53,6 +54,9 @@ print(json.dumps({"type": "system", "subtype": "init", "session_id": "s-8", "too
 print(json.dumps({"type": "system", "message": "a plain note"}), flush=True)
 print(json.dumps({"type": "assistant", "message": {"content": ["loose text", {"type": "text", "text": "hi"}]}}), flush=True)
 print(json.dumps(["not", "an", "event"]), flush=True)
+print(json.dumps({"type": "rate_limit_event", "rate_limit_info": {"unifiedWindows": {
+    "five_hour": {"utilization": 0.11, "resetsAt": 4000000000}}}}), flush=True)
+print(json.dumps({"type": "rate_limit_event", "rate_limit_info": "not a report"}), flush=True)
 print(json.dumps({"type": "result", "result": "done", "is_error": False}), flush=True)
 '''
 
@@ -159,6 +163,7 @@ def test_events_of_unexpected_shapes_are_skipped():
             threading.excepthook = hook
         assert not failures, failures
         assert result.ok and result.text == "done" and result.session_id == "s-8", result
+        assert claude_runner.reported()[0] == {"unifiedWindows": {"five_hour": {"utilization": 0.11, "resetsAt": 4000000000}}}
 
 
 def _run() -> None:

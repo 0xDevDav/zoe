@@ -124,6 +124,16 @@ FOREGROUND_LIMIT_MS = 120_000
 SECRET_ENV = ("ZOE_VAULT_KEY", "ZOE_BOT_TOKEN")
 
 
+# The plan's usage as the latest run reported it along with its request, as Claude Code's
+# rate_limit_event carries it, and when; empty until a run reports it.
+_reported: tuple[dict, float] = ({}, 0.0)
+
+
+def reported() -> tuple[dict, float]:
+    """The plan's usage the latest run reported, as Claude Code wrote it, and when it arrived."""
+    return _reported
+
+
 def _inherited() -> dict[str, str]:
     return {name: value for name, value in os.environ.items() if name not in SECRET_ENV}
 
@@ -298,6 +308,9 @@ class _Session:
                     self._written.clear()
                     self._replying = False
                 continue
+            if event.get("type") == "rate_limit_event" and isinstance(event.get("rate_limit_info"), dict):
+                global _reported
+                _reported = (event["rate_limit_info"], time.time())
             if event.get("type") == "system" and event.get("subtype") == "background_tasks_changed":
                 with self._lock:
                     self._background = {t.get("task_id", ""): t.get("description", "")

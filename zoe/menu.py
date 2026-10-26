@@ -31,7 +31,6 @@ from __future__ import annotations
 
 import html
 import logging
-import re
 import sqlite3
 import subprocess
 import time
@@ -448,12 +447,7 @@ class Menu:
             return i18n.t(lang, key, **kwargs)
 
         def name(label: str) -> str:
-            week = re.fullmatch(r"Current week \((.+)\)", label)
-            if label == "Current session":
-                return t("limit_session")
-            if week:
-                return t("limit_week") if week[1] == "all models" else t("limit_week_model", model=week[1])
-            return label
+            return t("limit_session") if label == "Current session" else t("limit_week")
 
         def resets(ts: float | None) -> str:
             if ts is None:

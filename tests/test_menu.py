@@ -184,8 +184,8 @@ def test_the_status_shows_claudes_limits_once_read():
     with tempfile.TemporaryDirectory() as tmp:
         conn, _, api, plain = _setup(Path(tmp))
         soon = time.time() + 3600
-        limits = [Limit("Current session", 42.0, soon), Limit("Current week (all models)", 91.0, None),
-                  Limit("Current week (Fable)", 104.0, time.time() + 3 * 86400)]
+        limits = [Limit("Current session", 42.0, soon), Limit("Current week (all models)", 104.0, time.time() + 3 * 86400),
+                  Limit("Current week (Fable)", 0.0, None)]
         menu = Menu(plain._cfg, api, Usage(plain._cfg, lambda: limits))
         assert len(_ask(conn, menu, OWNER, view="status")["blocks"]) == 1
         deadline = time.time() + 5
@@ -193,12 +193,11 @@ def test_the_status_shows_claudes_limits_once_read():
             time.sleep(0.01)
         heading, card = blocks[1:]
         assert heading == {"heading": "Limiti di Claude"}
-        session, week, fable = card["meters"]
+        session, week = card["meters"]
         assert (session["label"], session["value"], session["fill"], session["tone"]) == ("Sessione", "42%", 42.0, "")
         assert re.fullmatch(r"si azzera ([a-z]{3} )?\d\d:\d\d", session["detail"])
-        assert (week["label"], week["tone"], week["detail"]) == ("Settimana", "danger", "")
-        assert (fable["label"], fable["value"], fable["fill"], fable["tone"]) == ("Settimana Fable", "104%", 100, "danger")
-        assert re.fullmatch(r"si azzera [a-z]{3} \d\d:\d\d", fable["detail"])
+        assert (week["label"], week["value"], week["fill"], week["tone"]) == ("Settimana", "104%", 100, "danger")
+        assert re.fullmatch(r"si azzera [a-z]{3} \d\d:\d\d", week["detail"])
 
 
 def test_text_from_people_and_memories_is_shown_as_it_is():

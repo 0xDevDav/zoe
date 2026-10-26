@@ -8,7 +8,7 @@ from zoneinfo import ZoneInfo
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
-from zoe import usage
+from zoe import claude_runner, usage
 from zoe.config import Config
 from zoe.usage import Limit, Usage
 
@@ -48,6 +48,40 @@ def test_a_reading_runs_in_the_background_and_only_when_old():
     while not found.latest() and time.time() < deadline:
         time.sleep(0.01)
     assert found.latest() == [Limit("Current session", 10.0, None)] and len(readings) == 1
+
+
+def test_the_limits_a_run_reported_come_first_and_a_window_past_its_reset_is_unused():
+    readings = []
+
+    def reader() -> list[Limit]:
+        readings.append(time.time())
+        return [Limit("Current session", 30.0, None), Limit("Current week (Fable)", 0.0, None)]
+
+    found = Usage(Config(bot_token="", owner_ids=frozenset(), data_dir=Path("."), db_path=Path("x"),
+                         vault_path=Path("x"), vault_key_path=Path("x"), workdir=Path(".")), reader)
+    later = time.time() + 3600
+    report = {"status": "allowed", "unifiedWindows": {
+        "five_hour": {"utilization": 0.11, "resetsAt": later}, "seven_day": {"utilization": 0.07, "resetsAt": 1.0},
+        "overage": "not a window"}}
+    saved, claude_runner._reported = claude_runner._reported, (report, time.time())
+    try:
+        assert found.latest() == [Limit("Current session", 11.0, later), Limit("Current week (all models)", 0.0, None)]
+        assert readings == []
+
+        # A report older than FRESH, as while a long mind works alone: /usage is read, and its
+        # newer reading shows, without the limits of a single model.
+        claude_runner._reported = (report, time.time() - usage.FRESH - 1)
+        found.latest()
+        deadline = time.time() + 5
+        newer = [Limit("Current session", 30.0, None)]
+        while found.latest() != newer and time.time() < deadline:
+            time.sleep(0.01)
+        assert found.latest() == newer and len(readings) == 1
+        claude_runner._reported = (report, time.time() + 1)
+        assert found.latest()[0] == Limit("Current session", 11.0, later)
+    finally:
+        claude_runner._reported = saved
+    assert usage.from_report({"unifiedWindows": "none"}, time.time()) == []
 
 
 def _run() -> None:

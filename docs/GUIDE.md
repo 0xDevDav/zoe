@@ -86,10 +86,12 @@ tried to write, decide what Zoe proposes to improve, undo her last change to
 herself, and see her status as cards: since when she runs, version and model,
 whether Claude can work, turns running and queued, parallel minds at work, the
 last nightly review, and Claude's usage limits (the 5-hour session and the
-weekly ones, how much is used and when each resets). The limits come from
-Claude Code's own `/usage`, which answers without a model call; a reading runs
-in the background only while someone looks at the status, at most once every
-five minutes. Owners
+week, how much is used and when each resets). Every Claude run reports the
+limits along with its requests, and the status shows what the latest run
+reported. When that is more than five minutes old, as after a start or while a
+long mind works alone, Claude Code's own `/usage` is read too, without a model
+call; a reading runs in the background only while someone looks at the status,
+at most once every five minutes, and the newer of the two shows. Owners
 open the status straight away with `/stato` (or `/status`).
 Every view asks for fresh data each second and is drawn again only when
 something changed, never while a field is being written in; running times, such
@@ -723,7 +725,7 @@ for t in tests/test_*.py; do python "$t"; done
 | `improve.py` | the nightly study: proposals to improve Zoe, decided in the menu and made by a parallel mind |
 | `approve.py` | the owner's yes on Telegram before an action their rules mark as asking |
 | `availability.py` | whether Claude can work at all: turns and minds wait for a usage limit to reset, owners hear it once |
-| `usage.py` | Claude's usage limits, read from `/usage` in the background for the menu |
+| `usage.py` | Claude's usage limits for the menu, as the latest run reported them, or from `/usage` when that is old |
 | `signals.py` | readings about a person over time: moods, and later devices |
 | `telegram.py` | Telegram Bot API client |
 | `content.py` | every kind of Telegram content: classified, saved, transcribed or written out |
