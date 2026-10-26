@@ -333,7 +333,11 @@ def test_steps_are_kept_and_shown_as_plain_text():
 class PlansInPhases:
     """A run that plans three phases, starts the second, then replans with a phase for a fix and fails."""
 
+    def __init__(self) -> None:
+        self.prompts: list[str] = []
+
     def run(self, prompt_text, profile, on_step=None, cancel=None, interrupt=None, follow_for=0.0) -> Result:
+        self.prompts.append(prompt_text)
         key = re.search(r"Your key for this turn is (\w+)\.", prompt_text).group(1)
         on_step(Step("said", args={"text": f"Parto.\n[[{key} phases: Leggo il codice | Scrivo | Test]]"}))
         on_step(Step("said", args={"text": f"[[{key} phase: 2]]"}))
@@ -350,7 +354,12 @@ def test_a_mind_plans_its_phases_and_the_menu_shows_how_far_it_is():
                               Path(tmp))
         runner = PlansInPhases()
         runner.conn, runner.mind_id = conn, mind_id
-        _run_mind(conn, _engine(worker, runner))
+        engine = _engine(worker, runner)
+        _run_mind(conn, engine)
+        # The plan comes right after the task, before the long rules; a resumed mind that planned is not reminded.
+        first, again = runner.prompts
+        assert first.index("Your very first message") < first.index("Work until the task is done")
+        assert "You have not planned your phases yet" not in again
         assert (runner.seen.phases, runner.seen.phase) == (["Leggo il codice", "Scrivo", "Test"], 2)
         mind = minds.get(conn, mind_id)
         assert (mind.phases, mind.phase) == (["Leggo il codice", "Scrivo", "Test", "Correggo"], 2)
@@ -369,6 +378,10 @@ def test_a_mind_plans_its_phases_and_the_menu_shows_how_far_it_is():
         assert {"meters": [{"label": "Fase 2 di 4: Scrivo", "value": "25%", "fill": 25}]} in view["blocks"]
         assert {"text": "✅ Leggo il codice\n▶️ Scrivo\n⬜ Test\n⬜ Correggo"} in view["blocks"]
         assert minds.progress(minds.get(conn, other)) is None
+        # A mind resumed without a plan, as one that wrote only a phase line, is asked for it first.
+        conn.execute("UPDATE minds SET session_id = 's-2', phase = 2 WHERE id = ?", (other,))
+        resumed = engine._prompt(conn, owner, minds.get(conn, other), [], "")
+        assert resumed.index("You have not planned your phases yet") < resumed.index("Your very first message")
         conn.close()
 
 

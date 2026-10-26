@@ -288,12 +288,19 @@ def _end(conn: sqlite3.Connection, mind: Mind, event: str, text: str) -> None:
                       {"mind": mind.id, "neuron": mind.neuron_id, "event": event, "title": mind.title})
 
 
+# The plan in phases comes first, where a long brief cannot bury it: the menu draws the bar from it.
+_PHASES = (
+    "Your very first message, before any tool, is one line that plans the work in two to eight phases of a few "
+    "words each, studying the task included: [[{k} phases: Read the code | Write | Test | Fix]]. Each time you "
+    "start a phase, write [[{k} phase: 2]] with its number. {name} follows the bar they draw in the menu. When "
+    "the plan changes, for example a test fails and the fix needs a phase of its own, write the phases line "
+    "again with the whole new list. Only a task of one or two steps skips them."
+)
+_PHASES_MISSING = (
+    "You have not planned your phases yet: before anything else, write the phases line for the whole task, "
+    "then the phase line of the one you are in."
+)
 _ENDING = (
-    "Before you start, plan the work in two to eight phases, each a few words, and write them on a line of "
-    "their own as [[{k} phases: First | Second | Third]]; when you start a phase, write [[{k} phase: 2]] with "
-    "its number, so {name} sees in the menu how far you are. When the plan changes, for example a test fails "
-    "and the fix needs a phase of its own, write the phases line again with the whole new list. A task of a "
-    "few minutes needs no phases. "
     "Work until the task is done, and verify it the way the brief asks or the way a careful professional "
     "would: build it, run the tests, open the result. Never wait for something to happen on its own (a "
     "scheduled run, a message, a file changing): run it once yourself to check it, and leave the watching to "
@@ -503,11 +510,14 @@ class Minds(threading.Thread):
     def _prompt(self, conn: sqlite3.Connection, person: Person, mind: Mind, notes: list[str], interrupted: str) -> str:
         ending = directives.how(mind.directive_key) + " " + _ENDING.format(
             name=person.name, language=i18n.language_name(person.language), k=mind.directive_key)
+        phases = _PHASES.format(name=person.name, k=mind.directive_key)
         passed = f"Zoe passes this on from {person.name}: " + " | ".join(notes) if notes else ""
         if mind.session_id:
             why = f"Your previous run {interrupted}." if interrupted else (
                 "" if notes else "Your run was interrupted by a restart.")
-            return "\n".join(p for p in (why, passed, "Carry on with the task from where you were.", ending) if p)
+            missing = "" if mind.phases else _PHASES_MISSING
+            return "\n".join(p for p in (why, passed, "Carry on with the task from where you were.", missing, phases,
+                                          ending) if p)
 
         brain = Brain(conn, person.id)
         seeds = {**brain.search(mind.brief), **({mind.neuron_id: 1.0} if mind.neuron_id else {})}
@@ -515,13 +525,13 @@ class Minds(threading.Thread):
         instructions = self._cfg.workdir / "CLAUDE.md"
         parts = [
             f"You are a parallel mind of Zoe, the personal assistant of {person.name}. Zoe handed you this task "
-            f"so that her chat stays free: you work on your own, nobody watches your steps, and Zoe tells "
-            f"{person.name} what you report.",
+            f"so that her chat stays free: you work on your own and Zoe tells {person.name} what you report.",
             f"\nTask: {mind.title}\n{mind.brief}",
             f"\nWork in {mind.workdir}. Now: {datetime.now().astimezone():%a %d %b %Y %H:%M %z}.",
+            f"\n{phases}",
         ]
         if instructions.exists():
-            parts.append(f"Read {instructions} first: it holds {person.name}'s standing instructions.")
+            parts.append(f"Read {instructions} before you work: it holds {person.name}'s standing instructions.")
         if memories:
             parts += ["\nWhat Zoe remembers that may help:", *(f"- {m}" for m in memories[:_MEMORIES])]
         if passed:
