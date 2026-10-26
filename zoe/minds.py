@@ -9,6 +9,8 @@ than minutes. The chat stays free while it works.
   it resumes where it was instead of starting over.
 - Zoe sees in every turn which minds are working, for how long and on what; the
   person follows and stops them in the menu (``menu.py``).
+- A mind plans its work in phases and marks the one it starts, so the menu shows
+  how far it is.
 - A note for a working mind interrupts it and resumes its session with the note.
 - A mind that needs a decision ends with a question; Zoe asks the person, and
   the answer resumes the mind.
@@ -65,6 +67,8 @@ class Mind:
     session_id: str
     directive_key: str
     steps: list[str]
+    phases: list[str]
+    phase: int
     notes: list[str]
     question: str
     result: str
@@ -78,10 +82,31 @@ def _mind(row: sqlite3.Row) -> Mind:
     return Mind(
         row["id"], row["neuron_id"], row["person_id"], row["chat_id"], row["title"], row["brief"], row["workdir"],
         row["state"], row["session_id"] or "", row["directive_key"] or "",
-        json.loads(row["steps"] or "[]"), json.loads(row["notes"] or "[]"),
+        json.loads(row["steps"] or "[]"), json.loads(row["phases"] or "[]"), row["phase"],
+        json.loads(row["notes"] or "[]"),
         row["question"] or "", row["result"] or "", row["attempts"], row["started_at"], row["finished_at"],
         row["created_at"],
     )
+
+
+@dataclass(frozen=True)
+class Progress:
+    done: int
+    total: int
+    current: str
+
+    @property
+    def share(self) -> int:
+        return round(100 * self.done / self.total)
+
+
+def progress(mind: Mind) -> Progress | None:
+    """How far a mind is by the phases it planned: those before the one it works on are done.
+    None while it has planned none."""
+    if not mind.phases:
+        return None
+    current = min(max(mind.phase, 1), len(mind.phases))
+    return Progress(current - 1, len(mind.phases), mind.phases[current - 1])
 
 
 def duration(seconds: float) -> str:
@@ -264,6 +289,11 @@ def _end(conn: sqlite3.Connection, mind: Mind, event: str, text: str) -> None:
 
 
 _ENDING = (
+    "Before you start, plan the work in two to eight phases, each a few words, and write them on a line of "
+    "their own as [[{k} phases: First | Second | Third]]; when you start a phase, write [[{k} phase: 2]] with "
+    "its number, so {name} sees in the menu how far you are. When the plan changes, for example a test fails "
+    "and the fix needs a phase of its own, write the phases line again with the whole new list. A task of a "
+    "few minutes needs no phases. "
     "Work until the task is done, and verify it the way the brief asks or the way a careful professional "
     "would: build it, run the tests, open the result. Never wait for something to happen on its own (a "
     "scheduled run, a message, a file changing): run it once yourself to check it, and leave the watching to "
@@ -279,16 +309,23 @@ _ENDING = (
 
 
 class _Steps:
-    """Keeps the last steps of a run, saved now and then so Zoe and the menu can show them."""
+    """Keeps the last steps of a run and the phases its text plans and starts, saved now and then
+    so Zoe and the menu can show them; a phase change is saved at once."""
 
     def __init__(self, conn: sqlite3.Connection, mind: Mind, language: str) -> None:
         self._conn = conn
         self._id = mind.id
+        self._key = mind.directive_key
         self._language = language
         self.lines = list(mind.steps)
+        self.phases = list(mind.phases)
+        self.phase = mind.phase
         self._saved = 0.0
 
     def step(self, step: Step) -> None:
+        if step.kind == "said":
+            self._plan(step.args.get("text", ""))
+            return
         if step.kind != "tool":
             return
         line = describe(step, self._language)
@@ -297,9 +334,21 @@ class _Steps:
         if time.monotonic() - self._saved > _SAVE_EVERY:
             self.save()
 
+    def _plan(self, text: str) -> None:
+        _, found = directives.extract(text, self._key)
+        planned, started = directives.phases(found), directives.phase(found)
+        if planned is None and started is None:
+            return
+        if planned is not None:
+            self.phases, self.phase = planned, started or min(max(self.phase, 1), len(planned))
+        else:
+            self.phase = started
+        self.save()
+
     def save(self) -> None:
         self._saved = time.monotonic()
-        self._conn.execute("UPDATE minds SET steps = ? WHERE id = ?", (json.dumps(self.lines), self._id))
+        self._conn.execute("UPDATE minds SET steps = ?, phases = ?, phase = ? WHERE id = ?",
+                           (json.dumps(self.lines), json.dumps(self.phases), self.phase, self._id))
 
 
 class Minds(threading.Thread):

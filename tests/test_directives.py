@@ -7,7 +7,8 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
 from zoe import directives, style
 from zoe.directives import (
-    MAX_OPTIONS, ask, corrections, forwards, minds, options, plans, quote, reaction, skip, stops, tells, unplans,
+    MAX_OPTIONS, ask, corrections, forwards, minds, options, phase, phases, plans, quote, reaction, skip, stops,
+    tells, unplans,
 )
 from zoe.telegram import REACTIONS, TelegramAPI
 
@@ -34,6 +35,12 @@ def test_directives_are_removed_and_interpreted():
     assert reply == "Fatto, lo apro."
     assert corrections(found) == [("Grafana", "gravana")]
     assert reaction(found) == "👍"
+
+
+def test_a_mind_names_its_phases_and_the_one_it_starts():
+    reply, found = extract("Parto.\n[[{k} phases: Leggo |  | Scrivo | Test ]]\n[[{k} phase: 2]]\n[[{k} phase: 3]]")
+    assert reply == "Parto." and phases(found) == ["Leggo", "Scrivo", "Test"] and phase(found) == 3
+    assert phases([]) is None and phase([("phase", "zero")]) is None and phases([("phases", " | ")]) is None
 
 
 def test_only_the_turns_key_acts_and_never_inside_code():

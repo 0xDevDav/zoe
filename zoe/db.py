@@ -30,6 +30,8 @@ _ADDED_COLUMNS = (
     ("minds", "directive_key", "TEXT"),
     ("persons", "folders", "TEXT"),
     ("outbox", "options", "TEXT"),
+    ("minds", "phases", "TEXT"),
+    ("minds", "phase", "INTEGER NOT NULL DEFAULT 0"),
 )
 
 

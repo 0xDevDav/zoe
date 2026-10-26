@@ -202,6 +202,8 @@ CREATE TABLE IF NOT EXISTS minds (
     session_id  TEXT,
     directive_key TEXT,
     steps       TEXT,
+    phases      TEXT,
+    phase       INTEGER NOT NULL DEFAULT 0,
     notes       TEXT,
     question    TEXT,
     result      TEXT,

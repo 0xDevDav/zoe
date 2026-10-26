@@ -330,6 +330,48 @@ def test_steps_are_kept_and_shown_as_plain_text():
         conn.close()
 
 
+class PlansInPhases:
+    """A run that plans three phases, starts the second, then replans with a phase for a fix and fails."""
+
+    def run(self, prompt_text, profile, on_step=None, cancel=None, interrupt=None, follow_for=0.0) -> Result:
+        key = re.search(r"Your key for this turn is (\w+)\.", prompt_text).group(1)
+        on_step(Step("said", args={"text": f"Parto.\n[[{key} phases: Leggo il codice | Scrivo | Test]]"}))
+        on_step(Step("said", args={"text": f"[[{key} phase: 2]]"}))
+        self.seen = minds.get(self.conn, self.mind_id)
+        on_step(Step("said", args={"text": "[[000000 phase: 3]] a line without the key does nothing"}))
+        on_step(Step("said", args={"text": f"[[{key} phases: Leggo il codice | Scrivo | Test | Correggo]]"}))
+        return Result(False, "", False, False, 1, 1.0, session_id="s-1")
+
+
+def test_a_mind_plans_its_phases_and_the_menu_shows_how_far_it_is():
+    with tempfile.TemporaryDirectory() as tmp:
+        conn, owner, worker, *_ = worker_setup(Path(tmp), on_disk=True)
+        mind_id = minds.start(conn, Brain(conn, owner.id), owner, OWNER, "Sito pizzeria", "Crea il sito", "", [],
+                              Path(tmp))
+        runner = PlansInPhases()
+        runner.conn, runner.mind_id = conn, mind_id
+        _run_mind(conn, _engine(worker, runner))
+        assert (runner.seen.phases, runner.seen.phase) == (["Leggo il codice", "Scrivo", "Test"], 2)
+        mind = minds.get(conn, mind_id)
+        assert (mind.phases, mind.phase) == (["Leggo il codice", "Scrivo", "Test", "Correggo"], 2)
+        assert minds.progress(mind) == minds.Progress(1, 4, "Scrivo") and minds.progress(mind).share == 25
+
+        started = time.time() - 60
+        conn.execute("UPDATE minds SET state = 'running', started_at = ? WHERE id = ?", (started, mind_id))
+        other = minds.start(conn, Brain(conn, owner.id), owner, OWNER, "Ricerca", "Cerca", "", [], Path(tmp))
+        menu = Menu(worker._cfg, FakeAPI())
+        view = menu.answer(conn, owner, {"view": "minds"})
+        [meter] = view["blocks"][1]["meters"]
+        assert meter == {"label": "⚙️ Sito pizzeria", "value": "25%", "fill": 25, "since": started,
+                         "detail": "{elapsed}, Fase 2 di 4: Scrivo", "to": f"mind:{mind_id}"}
+        assert [row["to"] for row in view["blocks"][2]["items"]] == [f"mind:{other}"]
+        view = menu.answer(conn, owner, {"view": f"mind:{mind_id}"})
+        assert {"meters": [{"label": "Fase 2 di 4: Scrivo", "value": "25%", "fill": 25}]} in view["blocks"]
+        assert {"text": "✅ Leggo il codice\n▶️ Scrivo\n⬜ Test\n⬜ Correggo"} in view["blocks"]
+        assert minds.progress(minds.get(conn, other)) is None
+        conn.close()
+
+
 def _run() -> None:
     for name, fn in sorted(globals().items()):
         if name.startswith("test_") and callable(fn):

@@ -20,6 +20,9 @@ def test_stream_events_become_steps():
     writing = {"type": "stream_event", "event": {"type": "content_block_start", "content_block": {"type": "text"}}}
     assert to_steps(writing) == [Step("writing")]
     assert to_steps({"type": "stream_event", "event": {"type": "content_block_delta"}}) == []
+    said = {"type": "assistant", "message": {"content": [
+        {"type": "text", "text": "Leggo il codice."}, {"type": "tool_use", "name": "Read", "input": {}}]}}
+    assert to_steps(said) == [Step("said", args={"text": "Leggo il codice."}), Step("tool", "Read", {})]
 
 
 def test_steps_read_naturally_in_both_languages():

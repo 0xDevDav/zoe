@@ -290,9 +290,14 @@ than minutes. The chat stays free, and the owner can ask her anything else.
 - A mind never writes to the chat itself, even when its brief asks: its report
   gives the full path of every file to show, and Zoe sends them with the news,
   so whatever the person sees passes through her and stays in the chat log.
+- A mind plans its work in a few phases with `[[KEY phases: Read | Write | Test]]`
+  and marks the one it starts with `[[KEY phase: 2]]`; when a fix needs a phase
+  of its own, it writes the whole list again. A task of a few minutes plans none.
 - In the menu, "Parallel minds" lists the minds at work, each with its state, for
-  how long and what it is doing, and the last ones that ended. A mind's page
-  shows its folder, last steps, brief and result, and stops it. While minds work
+  how long and what it is doing, and the last ones that ended. A mind that
+  planned its phases shows a bar of how far it is and the phase it works on. A
+  mind's page shows its folder, its phases ticked off, last steps, brief and
+  result, and stops it. While minds work
   the chat gets nothing from them but their news.
 - Only owners start minds.
 

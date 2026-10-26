@@ -40,7 +40,8 @@ class Profile:
 
 @dataclass(frozen=True)
 class Step:
-    """One visible thing Claude is doing: ``thinking``, ``writing``, or using a ``tool``."""
+    """One visible thing Claude is doing: ``thinking``, ``writing``, or using a ``tool``; ``said``
+    carries the text Claude wrote, once it is whole."""
 
     kind: str
     tool: str = ""
@@ -96,8 +97,9 @@ def to_steps(event: dict) -> list[Step]:
             if block == "text":
                 return [Step("writing")]
     elif kind == "assistant":
-        return [Step("tool", block.get("name", ""), block.get("input") or {})
-                for block in _blocks(event) if block.get("type") == "tool_use"]
+        return [Step("tool", block.get("name", ""), block.get("input") or {}) if block.get("type") == "tool_use"
+                else Step("said", args={"text": block.get("text", "")})
+                for block in _blocks(event) if block.get("type") in ("tool_use", "text")]
     return []
 
 

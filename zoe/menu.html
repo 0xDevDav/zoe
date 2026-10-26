@@ -63,6 +63,8 @@ button.row:active { background: var(--line); }
 .meter .bar { height: 8px; margin-top: 10px; border-radius: 4px; background: color-mix(in srgb, var(--text) 12%, transparent); overflow: hidden; }
 .meter .bar i { display: block; height: 100%; border-radius: 4px; background: var(--accent); }
 .meter small { display: block; margin-top: 8px; color: var(--muted); font-size: 13px; }
+button.meter { display: block; width: 100%; border: 0; border-radius: 0; background: none; color: inherit; font: inherit; text-align: left; }
+.meter.go .top span::after { content: " ›"; color: var(--muted); }
 .meter.danger .top strong { color: var(--danger); }
 .meter.danger .bar i { background: var(--danger); }
 .quote summary { color: var(--muted); list-style: none; overflow-wrap: anywhere; }

@@ -25,6 +25,8 @@ on either. The names:
 - ``tell: 3 | text``: a note or an answer for parallel mind 3;
 - ``stop: 3``: stop parallel mind 3;
 - ``ask: question``: a parallel mind needs a decision to go on;
+- ``phases: Read the code | Write | Test``: the phases of a parallel mind's work, and
+  ``phase: 2``: the phase it starts now, so the menu shows how far it is;
 - ``admit: 123456789 | Name``: let that Telegram account write to Zoe, the name being optional;
 - ``keep: 12 | what it is | new place``: keep received file 12 for good, the new place
   given when Zoe moved it;
@@ -47,7 +49,7 @@ log = logging.getLogger("zoe.directives")
 MAX_OPTIONS = 8
 _OPTION_LENGTH = 40
 _NAMES = (
-    "term|react|options|plan|unplan|skip|quote|voice|edit|tell|stop|ask|admit|keep|discard|send|share|unshare|used"
+    "term|react|options|plan|unplan|skip|quote|voice|edit|tell|stop|ask|phases|phase|admit|keep|discard|send|share|unshare|used"
 )
 _CODE = re.compile(r"<pre\b.*?</pre>|<code\b.*?</code>|```.*?```|`[^`\n]*`", re.IGNORECASE | re.DOTALL)
 
@@ -248,6 +250,23 @@ def stops(found: list[tuple[str, str]]) -> list[int]:
 
 def ask(found: list[tuple[str, str]]) -> str | None:
     return next((value.strip() for name, value in found if name == "ask" and value.strip()), None)
+
+
+_PHASES = 12
+_PHASE_LENGTH = 60
+
+
+def phases(found: list[tuple[str, str]]) -> list[str] | None:
+    """The phases a mind's work is planned in, by the latest phases directive, or None without one."""
+    value = next((value for name, value in reversed(found) if name == "phases"), None)
+    if value is None:
+        return None
+    return [label.strip()[:_PHASE_LENGTH] for label in value.split("|") if label.strip()][:_PHASES] or None
+
+
+def phase(found: list[tuple[str, str]]) -> int | None:
+    """The phase a mind starts now, by the latest phase directive, counted from 1."""
+    return next((n for name, value in reversed(found) if name == "phase" and (n := _number(value))), None)
 
 
 def quote(found: list[tuple[str, str]]) -> int | None:

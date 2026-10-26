@@ -140,6 +140,8 @@ class Progress:
     def step(self, step: Step) -> None:
         """Show only what is happening now: thinking keeps the last action in view, any other
         state clears it, and each new action replaces the one before."""
+        if step.kind == "said":
+            return
         with self._lock:
             if step.kind in _STATES:
                 self._state = step.kind

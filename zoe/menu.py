@@ -200,8 +200,12 @@ class Menu:
             now = time.time()
             working, ended = minds.active(conn, person.id), minds.recent(conn, person.id, 5)
             blocks = [_text(t("minds_intro") if working or ended else t("minds_none"))]
-            if working:
-                blocks.append(_items(*(self._working(m, lang) for m in working)))
+            # A mind that planned its phases shows a bar of how far it is; the others a row.
+            planned = [m for m in working if m.state == "running" and minds.progress(m)]
+            if planned:
+                blocks.append({"meters": [self._meter(m, lang, to=f"mind:{m.id}") for m in planned]})
+            if rest := [m for m in working if m not in planned]:
+                blocks.append(_items(*(self._working(m, lang) for m in rest)))
             if ended:
                 blocks += [{"heading": t("minds_recent")}, _items(*(
                     _entry(m.title, self._state(m, lang, now), to=f"mind:{m.id}") for m in ended))]
@@ -214,6 +218,10 @@ class Menu:
             working = mind.state in minds.ACTIVE
             started = (mind.started_at or mind.created_at) if mind.state == "running" else None
             blocks = [_text(self._state(mind, lang, time.time()), started), {"code": mind.workdir}]
+            if mind.state == "running" and (done := minds.progress(mind)):
+                marks = ["✅"] * done.done + ["▶️"] + ["⬜"] * (done.total - done.done - 1)
+                blocks += [{"heading": t("mind_phases")}, {"meters": [self._meter(mind, lang)]},
+                           _text("\n".join(f"{mark} {name}" for mark, name in zip(marks, mind.phases)))]
             if mind.steps and working:
                 blocks += [{"heading": t("mind_steps")}, _text("\n".join(f"• {s}" for s in mind.steps))]
             blocks += [{"heading": t("mind_brief")}, {"quote": mind.brief}]
@@ -383,6 +391,16 @@ class Menu:
             ago=minds.duration(now - (mind.finished_at or now)),
             question=mind.question,
         )
+
+    @staticmethod
+    def _meter(mind: minds.Mind, lang: str, to: str = "") -> dict:
+        """A bar of how far a running mind is by its phases; in a list, ``to`` opens the mind."""
+        done = minds.progress(mind)
+        phase = i18n.t(lang, "mind_phase", number=done.done + 1, total=done.total, name=done.current)
+        if not to:
+            return {"label": phase, "value": f"{done.share}%", "fill": done.share}
+        return {"label": f"{_MIND_ICON[mind.state]} {mind.title}", "value": f"{done.share}%", "fill": done.share,
+                "detail": f"{ELAPSED}, {phase}", "since": mind.started_at or mind.created_at, "to": to}
 
     @staticmethod
     def _working(mind: minds.Mind, lang: str) -> dict:

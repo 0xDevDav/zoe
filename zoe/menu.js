@@ -118,10 +118,11 @@ function block(part) {
     return grid;
   }
   if ("meters" in part) {
-    // A bar for each figure, filled to its share of 100 and coloured by its tone.
+    // A bar for each figure, filled to its share of 100 and coloured by its tone; one with a view opens it.
     const card = el("div", "meters");
     for (const meter of part.meters) {
-      const row = el("div", ["meter", meter.tone].join(" ").trim());
+      const row = el(meter.to ? "button" : "div", ["meter", meter.tone, meter.to ? "go" : ""].join(" ").trim());
+      if (meter.to) row.onclick = () => go({ view: meter.to });
       const top = el("div", "top");
       top.append(el("span", "", meter.label), el("strong", "", meter.value));
       const bar = el("div", "bar");
@@ -129,7 +130,7 @@ function block(part) {
       fill.style.width = meter.fill + "%";
       bar.append(fill);
       row.append(top, bar);
-      if (meter.detail) row.append(el("small", "", meter.detail));
+      if (meter.detail) row.append(timed(el("small", "", meter.detail), meter.since));
       card.append(row);
     }
     return card;
