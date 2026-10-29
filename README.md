@@ -168,6 +168,20 @@ For a server, `deploy/` holds the systemd units with the reasons for every setti
 The menu needs an HTTPS address in `ZOE_MENU_URL` behind a reverse proxy; Telegram's
 long polling needs no open port.
 
+### Your plan, your terms
+
+Zoe drives the official `claude` CLI as Anthropic publishes it and never reads, stores
+or passes on your Claude credentials: you sign in through Anthropic's own flow, and
+each installation runs on its owner's subscription or API key. A Free, Pro or Max plan
+comes under the [Consumer Terms](https://www.anthropic.com/legal/consumer-terms), with
+limits meant for ordinary individual use, so it suits Zoe as your own assistant.
+Offering Zoe to other people as a service comes under the
+[Commercial Terms](https://www.anthropic.com/legal/commercial-terms) and needs API key
+authentication: a claude.ai login may not serve anyone else's requests. See Claude
+Code's [legal and compliance](https://code.claude.com/docs/en/legal-and-compliance)
+page and the [Usage Policy](https://www.anthropic.com/legal/aup). Each user is
+responsible for using Zoe within Anthropic's terms.
+
 ## Learn more
 
 [Zoe in depth](docs/GUIDE.md) is the full guide: people and access, the menu, the
