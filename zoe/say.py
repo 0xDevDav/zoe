@@ -49,6 +49,14 @@ TRIES = 5
 MAX_OPTIONS = 8
 
 
+def notice_recipients(conn: sqlite3.Connection, cfg: Config) -> list[tuple[int, str]]:
+    """Return (Telegram user id, language) of the chat that hears Zoe's own notices: the owner's
+    main chat, the first in ZOE_OWNER_IDS, or every owner account when that chat is not one."""
+    owners = access.owner_recipients(conn)
+    main = [owner for owner in owners if owner[0] == cfg.owner_chat]
+    return main or owners
+
+
 def queue(
     conn: sqlite3.Connection,
     home: Path,

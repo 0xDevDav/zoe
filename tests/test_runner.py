@@ -60,6 +60,19 @@ print(json.dumps({"type": "rate_limit_event", "rate_limit_info": "not a report"}
 print(json.dumps({"type": "result", "result": "done", "is_error": False}), flush=True)
 '''
 
+# A turn Claude cannot answer: its synthetic message carries the error code, then the error
+# result. The error code and the words come from the last two arguments.
+FAILING_CLAUDE = r'''
+import json, sys
+sys.stdin.read()
+code, words = sys.argv[-2], sys.argv[-1]
+print(json.dumps({"type": "system", "subtype": "init", "session_id": "s-9", "tools": []}), flush=True)
+print(json.dumps({"type": "assistant", "error": code, "is_api_error_message": True,
+                  "message": {"model": "<synthetic>", "content": [{"type": "text", "text": words}]}}), flush=True)
+print(json.dumps({"type": "result", "subtype": "success", "is_error": True, "result": words}), flush=True)
+sys.exit(1)
+'''
+
 
 def _claude(folder: Path, source: str = FAKE_CLAUDE) -> str:
     """A command that runs the stand-in, as ``claude`` would be run."""
@@ -164,6 +177,28 @@ def test_events_of_unexpected_shapes_are_skipped():
         assert not failures, failures
         assert result.ok and result.text == "done" and result.session_id == "s-8", result
         assert claude_runner.reported()[0] == {"unifiedWindows": {"five_hour": {"utilization": 0.11, "resetsAt": 4000000000}}}
+
+
+def _failing(code: str, words: str) -> claude_runner.Result:
+    with tempfile.TemporaryDirectory() as tmp:
+        runner = ClaudeRunner(_claude(Path(tmp), FAILING_CLAUDE), "model", hard_timeout=30, inactivity_timeout=5)
+        return runner.run("ciao", Profile((code, words), Path(tmp)))
+
+
+def test_a_logged_out_claude_is_unavailable_by_its_error_code_whatever_its_words():
+    logged_out = _failing("authentication_failed", "Not logged in · Please run /login")
+    assert not logged_out.ok and logged_out.error_code == "authentication_failed"
+    assert claude_runner.unavailable(logged_out) == "Not logged in · Please run /login"
+    reworded = _failing("authentication_failed", "Your session has ended, sign in again")
+    assert claude_runner.unavailable(reworded) == "Your session has ended, sign in again"
+    silent = _failing("billing_error", "")
+    assert claude_runner.unavailable(silent) == "billing_error"
+
+
+def test_a_turn_failing_with_another_error_code_is_not_a_reason_to_wait():
+    failed = _failing("server_error", "Something broke on the way")
+    assert not failed.ok and failed.error_code == "server_error"
+    assert claude_runner.unavailable(failed) == ""
 
 
 def _run() -> None:

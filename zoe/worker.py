@@ -23,7 +23,7 @@ from pathlib import Path
 
 from . import (
     access, approve, availability, choices, content, directives, files, formatting, i18n, minds, planner, prompt,
-    receipts, store, vocabulary,
+    receipts, say, store, vocabulary,
 )
 from .access import Person
 from .brain import Brain
@@ -408,7 +408,7 @@ class Worker(threading.Thread):
         if reason:
             self._wait_for_claude(conn, msg, reason)
             return
-        availability.works(conn, self._cfg.data_dir)
+        availability.works(conn, self._cfg)
         if result.ok and result.text:
             reply, found = directives.extract(result.text, key)
             for term, heard in directives.corrections(found):
@@ -440,12 +440,12 @@ class Worker(threading.Thread):
             return
 
         if result.refused:
-            # Claude came up with more than this person may use: never retried, and the owners are told.
+            # Claude came up with more than this person may use: never retried, and the owner is told.
             log.error("turn of message %d stopped as it started: it had %s", msg.id, result.refused)
             store.release(conn, msg.chat_id, keep=msg.id)
             store.mark(conn, msg.id, "failed")
             self._api.notify(msg.chat_id, i18n.t(person.language, "error_notice"))
-            for owner_id, owner_language in access.owner_recipients(conn):
+            for owner_id, owner_language in say.notice_recipients(conn, self._cfg):
                 self._api.notify(owner_id, i18n.t(owner_language, "turn_refused", name=html.escape(person.name),
                                                   what=html.escape(result.refused)))
             return
@@ -456,11 +456,11 @@ class Worker(threading.Thread):
                 store.note(conn, msg.id, "resume", result.session_id)
                 store.note(conn, msg.id, "key", key)
             self._retry_or_give_up(conn, person, msg, "given_up")
-            for owner_id, owner_language in access.owner_recipients(conn):
+            for owner_id, owner_language in say.notice_recipients(conn, self._cfg):
                 self._api.notify(owner_id, i18n.t(owner_language, "stuck_notice"))
             return
 
-        log.error("message %d failed (rc=%s)", msg.id, result.returncode)
+        log.error("message %d failed (rc=%s): %s", msg.id, result.returncode, result.failure[:200])
         self._retry_or_give_up(conn, person, msg, "error_notice")
 
     def _reply(
@@ -605,7 +605,7 @@ class Worker(threading.Thread):
             try:
                 if not chosen:
                     raise TelegramError("no such file of this person")
-                sent = files.send(self._api, chat_id, chosen, caption, uncompressed)
+                sent = files.send(self._api, chat_id, chosen, formatting.to_telegram(caption), uncompressed)
             except TelegramError as exc:
                 log.warning("file %r not sent to %s: %s", target, chat_id, exc)
                 notice = "files_not_sent" if "," in target else "file_not_sent"
@@ -650,7 +650,7 @@ class Worker(threading.Thread):
         without counting as an attempt, and waits with every other turn (``availability``)."""
         store.release(conn, msg.chat_id, keep=msg.id)
         store.requeue(conn, msg.id, counted=False)
-        availability.down(conn, self._cfg.data_dir, reason)
+        availability.down(conn, self._cfg, reason)
 
     def _retry_or_give_up(self, conn: sqlite3.Connection, person: Person, msg: store.Message, notice: str) -> None:
         store.release(conn, msg.chat_id, keep=msg.id)

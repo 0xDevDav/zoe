@@ -19,6 +19,7 @@ from __future__ import annotations
 
 import logging
 import sqlite3
+import struct
 import time
 from dataclasses import dataclass
 from pathlib import Path
@@ -36,6 +37,12 @@ SEND_LIMIT = 50 * 1048576
 _PHOTO_LIMIT = 10 * 1048576
 _IMAGES = (".jpg", ".jpeg", ".png", ".webp")
 _VIDEOS = (".mp4",)
+# The shapes Telegram takes as a photo: width plus height at most this, the long side at most this
+# many times the short one.
+_PHOTO_SIDES = 10000
+_PHOTO_RATIO = 20
+# JPEG markers that start a frame and hold its size.
+_JPEG_FRAMES = {0xC0, 0xC1, 0xC2, 0xC3, 0xC5, 0xC6, 0xC7, 0xC9, 0xCA, 0xCB, 0xCD, 0xCE, 0xCF}
 # The most files Telegram puts in one album.
 ALBUM_LIMIT = 10
 
@@ -202,17 +209,59 @@ def resolve_all(
     return [] if (None, None) in chosen else chosen
 
 
-def _kind(path: Path, uncompressed: bool) -> str:
+def _dimensions(path: Path) -> tuple[int, int] | None:
+    """Width and height of a PNG, WebP or JPEG image read from its header, which in a JPEG can follow
+    long metadata; None when unknown."""
+    try:
+        with path.open("rb") as handle:
+            head = handle.read(1048576)
+    except OSError:
+        return None
+    if head.startswith(b"\x89PNG\r\n\x1a\n") and len(head) >= 24:
+        return struct.unpack(">II", head[16:24])
+    if head[:4] == b"RIFF" and head[8:12] == b"WEBP" and len(head) >= 30:
+        chunk = head[12:16]
+        if chunk == b"VP8X":
+            return int.from_bytes(head[24:27], "little") + 1, int.from_bytes(head[27:30], "little") + 1
+        if chunk == b"VP8 ":
+            width, height = struct.unpack("<HH", head[26:30])
+            return width & 0x3FFF, height & 0x3FFF
+        if chunk == b"VP8L":
+            bits = int.from_bytes(head[21:25], "little")
+            return (bits & 0x3FFF) + 1, ((bits >> 14) & 0x3FFF) + 1
+        return None
+    if head[:2] == b"\xff\xd8":
+        i = 2
+        while i + 9 <= len(head) and head[i] == 0xFF:
+            marker = head[i + 1]
+            if marker in _JPEG_FRAMES:
+                height, width = struct.unpack(">HH", head[i + 5:i + 9])
+                return width, height
+            i += 2 + struct.unpack(">H", head[i + 2:i + 4])[0]
+    return None
+
+
+def _odd_shape(path: Path) -> bool:
+    """Whether an image has a shape Telegram refuses as a photo, such as a long thin strip."""
+    size = _dimensions(path)
+    if not size or min(size) == 0:
+        return False
+    return sum(size) > _PHOTO_SIDES or max(size) / min(size) > _PHOTO_RATIO
+
+
+def _kind(path: Path, uncompressed: bool) -> tuple[str, bool]:
     """How an uploaded file is sent: as a photo or a video when Telegram takes it so and it may be
-    compressed, otherwise as a document."""
+    compressed, otherwise as a document; and whether it is an image going as a document only for its
+    shape."""
     size = path.stat().st_size
     if size > SEND_LIMIT:
         raise TelegramError(f"{path.name} is {size // 1048576} MB, over Telegram's 50 MB")
     if uncompressed:
-        return "document"
+        return "document", False
     if path.suffix.lower() in _IMAGES and size <= _PHOTO_LIMIT:
-        return "photo"
-    return "video" if path.suffix.lower() in _VIDEOS else "document"
+        odd = _odd_shape(path)
+        return ("document" if odd else "photo"), odd
+    return ("video" if path.suffix.lower() in _VIDEOS else "document"), False
 
 
 def send(
@@ -222,25 +271,29 @@ def send(
     caption: str,
     uncompressed: bool = False,
 ) -> list[dict]:
-    """Send files to a chat, the caption under the first, and return the messages they took. Several
-    files are uploaded as albums of up to ten, all as documents when one is neither a photo nor a
-    video, or when they go ``uncompressed``. Raises TelegramError when they cannot be sent, as for
-    files over 50 MB."""
+    """Send files to a chat, the caption under the first, and return the messages they took, in the
+    order of ``chosen``. Several files are uploaded as albums of up to ten: photos and videos together,
+    then the images whose shape Telegram refuses as a photo, as documents. All go as documents when one
+    is neither an image nor a video, or when they go ``uncompressed``. Raises TelegramError when they
+    cannot be sent, as for files over 50 MB."""
     if len(chosen) == 1:
         return [_send_one(api, chat_id, *chosen[0], caption, uncompressed)]
     if any(path is None for _, path in chosen):
         raise TelegramError("a file is no longer there")
-    items = [(_kind(path, uncompressed), path) for _, path in chosen]
-    if any(kind == "document" for kind, _ in items):
-        items = [("document", path) for _, path in items]
-    sent = []
-    for start in range(0, len(items), ALBUM_LIMIT):
-        group, text = items[start:start + ALBUM_LIMIT], caption if start == 0 else ""
-        if len(group) == 1:
-            sent.append(api.send_file(chat_id, group[0][0], text, path=group[0][1]))
-        else:
-            sent += api.send_album(chat_id, group, text)
-    return sent
+    kinds = [_kind(path, uncompressed) for _, path in chosen]
+    if any(kind == "document" and not odd for kind, odd in kinds):
+        kinds = [("document", False)] * len(kinds)
+    media = [n for n, (_, odd) in enumerate(kinds) if not odd]
+    shaped = [n for n, (_, odd) in enumerate(kinds) if odd]
+    sent: list[dict] = []
+    for group in (media, shaped):
+        for start in range(0, len(group), ALBUM_LIMIT):
+            items = [(kinds[n][0], chosen[n][1]) for n in group[start:start + ALBUM_LIMIT]]
+            sent += _upload(api, chat_id, items, "" if sent else caption)
+    messages: list[dict] = [{}] * len(chosen)
+    for n, message in zip(media + shaped, sent):
+        messages[n] = message
+    return messages
 
 
 def _send_one(
@@ -256,4 +309,18 @@ def _send_one(
             log.info("file %d sent again by upload: %s", found.id, exc)
     if path is None:
         raise TelegramError("the file is no longer there")
-    return api.send_file(chat_id, _kind(path, uncompressed), caption, path=path)
+    return _upload(api, chat_id, [(_kind(path, uncompressed)[0], path)], caption)[0]
+
+
+def _upload(api: TelegramAPI, chat_id: int, items: list[tuple[str, Path]], caption: str) -> list[dict]:
+    """Upload one file, or an album of them, each as its kind. When Telegram still refuses a photo for
+    its shape, as when its header could not be read, they go again as documents."""
+    try:
+        if len(items) == 1:
+            return [api.send_file(chat_id, items[0][0], caption, path=items[0][1])]
+        return api.send_album(chat_id, items, caption)
+    except TelegramError as exc:
+        if "PHOTO_INVALID_DIMENSIONS" not in str(exc) or all(kind != "photo" for kind, _ in items):
+            raise
+        log.info("%s sent as documents: %s", ", ".join(path.name for _, path in items), exc)
+        return _upload(api, chat_id, [("document", path) for _, path in items], caption)

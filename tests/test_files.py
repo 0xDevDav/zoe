@@ -1,10 +1,12 @@
 """Checks for received files: temporary unless kept, remembered when kept, deleted carefully, sent back."""
 
 import shutil
+import struct
 import sys
 import tempfile
 import threading
 import time
+import zlib
 from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
@@ -14,6 +16,7 @@ from fakes import OWNER, button_data, press, worker_setup
 from zoe import access, files, store
 from zoe.brain import Brain
 from zoe.ingest import Poller
+from zoe.telegram import TelegramError
 
 
 def _photo(conn, owner_id: int, update_id: int, file_id: str, caption: str = "") -> None:
@@ -125,6 +128,81 @@ def test_several_files_arrive_together_as_albums_logged_in_the_chat():
         assert "Non sono riuscita a mandarti i file" in api.to(OWNER)[-1]
         logged = [turn["text"] for turn in store.recent_history(conn, OWNER, 30)]
         assert "[file «shot0.png»] la card" in logged and "[file «clip.mp4»]" in logged
+
+
+def _png(path: Path, width: int, height: int) -> Path:
+    """A minimal PNG header of this size: enough for its shape to be read."""
+    def chunk(kind: bytes, data: bytes) -> bytes:
+        return struct.pack(">I", len(data)) + kind + data + struct.pack(">I", zlib.crc32(kind + data))
+    path.write_bytes(b"\x89PNG\r\n\x1a\n" + chunk(b"IHDR", struct.pack(">IIBBBBB", width, height, 8, 2, 0, 0, 0))
+                     + chunk(b"IDAT", zlib.compress(b"\x00")) + chunk(b"IEND", b""))
+    return path
+
+
+def test_images_telegram_refuses_as_photos_go_as_documents():
+    with tempfile.TemporaryDirectory() as tmp:
+        tmp = Path(tmp)
+        assert files._kind(_png(tmp / "phone.png", 390, 844), False)[0] == "photo"
+        assert files._kind(_png(tmp / "strip.png", 1280, 56), False)[0] == "document"
+        assert files._kind(_png(tmp / "huge.png", 9000, 2000), False)[0] == "document"
+        photo = tmp / "beach.jpg"
+        photo.write_bytes(b"\xff\xd8" + b"\xff\xe0" + struct.pack(">H", 16) + b"JFIF\x00" + bytes(9)
+                          + b"\xff\xc0" + struct.pack(">HBHH", 17, 8, 600, 800) + bytes(12))
+        assert files._dimensions(photo) == (800, 600) and files._kind(photo, False) == ("photo", False)
+        assert files._dimensions(tmp / "phone.png") == (390, 844)
+
+        def webp(name: str, chunk: bytes, body: bytes) -> Path:
+            path = tmp / name
+            path.write_bytes(b"RIFF" + bytes(4) + b"WEBP" + chunk + bytes(4) + body + bytes(8))
+            return path
+        extended = webp("x.webp", b"VP8X", bytes(4) + (1279).to_bytes(3, "little") + (55).to_bytes(3, "little"))
+        lossy = webp("y.webp", b"VP8 ", bytes(6) + struct.pack("<HH", 390, 844))
+        lossless = webp("z.webp", b"VP8L", b"\x2f" + (1279 | 55 << 14).to_bytes(4, "little"))
+        assert files._dimensions(extended) == (1280, 56) and files._kind(extended, False) == ("document", True)
+        assert files._dimensions(lossy) == (390, 844) and files._kind(lossy, False) == ("photo", False)
+        assert files._dimensions(lossless) == (1280, 56)
+
+
+def test_an_odd_image_in_an_album_goes_as_a_document_and_the_rest_as_photos():
+    with tempfile.TemporaryDirectory() as tmp:
+        tmp = Path(tmp)
+        conn, owner, worker, _, api = worker_setup(tmp, "")
+        strip = _png(tmp / "menu.png", 1280, 56)
+        shots = [_png(tmp / f"page{n}.png", 1280, 800) for n in range(3)]
+        sent = files.send(api, OWNER, [(None, path) for path in (strip, *shots)], "le schermate")
+        assert api.albums == [(OWNER, ["photo"] * 3, ["page0.png", "page1.png", "page2.png"], "le schermate")]
+        assert api.files[-1] == (OWNER, "document", "", None, strip)
+        assert [m["message_id"] for m in sent] == [104, 101, 102, 103]
+
+        sheet = tmp / "sheet.pdf"
+        sheet.write_bytes(b"data")
+        files.send(api, OWNER, [(None, strip), (None, shots[0]), (None, sheet)], "")
+        assert api.albums[-1][1] == ["document"] * 3
+
+
+def test_photos_telegram_still_refuses_for_their_shape_go_again_as_documents():
+    class Refusing:
+        def __init__(self) -> None:
+            self.sent: list[list[str]] = []
+
+        def send_file(self, chat_id, kind, caption="", file_id=None, path=None, silent=False, name=""):
+            return self.send_album(chat_id, [(kind, path)], caption)[0]
+
+        def send_album(self, chat_id, items, caption=""):
+            self.sent.append([kind for kind, _ in items])
+            if "photo" in self.sent[-1]:
+                raise TelegramError('sendMediaGroup rejected: Bad Request: "PHOTO_INVALID_DIMENSIONS"')
+            return [{"message_id": n} for n in range(len(items))]
+
+    with tempfile.TemporaryDirectory() as tmp:
+        api = Refusing()
+        image, clip = Path(tmp) / "odd.png", Path(tmp) / "clip.mp4"
+        image.write_bytes(b"png")
+        clip.write_bytes(b"mp4")
+        assert files.send(api, OWNER, [(None, image)], "eccola") == [{"message_id": 0}]
+        assert api.sent == [["photo"], ["document"]]
+        assert len(files.send(api, OWNER, [(None, image), (None, clip)], "")) == 2
+        assert api.sent[2:] == [["photo", "video"], ["document", "document"]]
 
 
 def test_the_receipt_deletes_a_kept_file_in_one_tap():

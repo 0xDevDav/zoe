@@ -1,6 +1,7 @@
 """Checks for a turn's messages: their Telegram numbers, quoting, replies, and messages written during a turn."""
 
 import dataclasses
+import os
 import re
 import sys
 import tempfile
@@ -13,12 +14,13 @@ from zoneinfo import ZoneInfo
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 
-from fakes import OWNER, button_data, message, press, worker_setup
+from fakes import FAKE_FAILURE, OTHER_OWNER_ACCOUNTS, OWNER, button_data, logged, message, press, worker_setup
 from test_runner import _claude
 from zoe import access, app, availability, claude_runner, formatting, i18n, planner, prompt, say, store
 from zoe import worker as worker_module
 from zoe.brain import Brain, Recalled
 from zoe.claude_runner import ClaudeRunner, Result
+from zoe.config import Config
 from zoe.ingest import Poller
 from zoe.telegram import TelegramError
 
@@ -199,6 +201,26 @@ def test_while_claude_cannot_work_turns_wait_and_the_owner_hears_it_once_and_whe
     assert worker_module.unavailable(written) == ""
 
 
+class BrokenTurn:
+    """Claude fails this turn with an error that does not stop every turn."""
+
+    def run(self, prompt_text, profile, on_step=None, cancel=None, interrupt=None, follow_for=0.0) -> Result:
+        return Result(False, "", False, False, 1, 0.1, failure=FAKE_FAILURE, error_code="server_error")
+
+
+def test_a_turn_failing_with_another_error_is_retried_and_given_up_without_waiting_for_claude():
+    with tempfile.TemporaryDirectory() as tmp:
+        conn, owner, worker, _, api = worker_setup(Path(tmp))
+        worker._runner = BrokenTurn()
+        store.record_inbound(conn, message(5, OWNER, "ciao"), owner.id)
+        with logged("zoe.worker") as lines:
+            while (msg := store.claim_next(conn)) is not None:
+                worker._handle(conn, msg)
+        assert any(FAKE_FAILURE in line for line in lines), lines
+        assert conn.execute("SELECT state FROM messages WHERE id = 1").fetchone()["state"] == "failed"
+        assert not availability.waiting(conn) and not store.get_state(conn, "claude_down")
+
+
 LIMIT = "You've hit your session limit · resets 6pm (Europe/Rome)"
 
 
@@ -244,6 +266,42 @@ def test_a_usage_limit_holds_the_turns_until_it_resets_and_says_when_once():
         assert len(told) == 1 and f"riprendo alle <b>{datetime.fromtimestamp(resume):%H:%M}" in told[0]
         assert not any("non ho potuto" in t.lower() or "Claude non può lavorare" in t for t in api.to(OWNER))
         assert conn.execute("SELECT COUNT(*) FROM messages WHERE state = 'failed'").fetchone()[0] == 0
+
+
+def test_notices_about_zoe_herself_reach_only_the_owners_main_chat():
+    with tempfile.TemporaryDirectory() as tmp:
+        conn, owner, worker, _, api = worker_setup(Path(tmp), others=OTHER_OWNER_ACCOUNTS)
+        worker._runner = OutOfUsage()
+        store.record_inbound(conn, message(5, OWNER, "ciao"), owner.id)
+        worker._handle(conn, store.claim_next(conn))
+        store.set_state(conn, claude_runner.RETRY_AT, "0")
+        worker._runner = StuckThenDone()
+        store.record_inbound(conn, message(6, OTHER_OWNER_ACCOUNTS[0], "aggiorna il server"), owner.id)
+        worker._handle(conn, store.claim_next(conn))
+        say.deliver(conn, api)
+        assert sum("limite di utilizzo" in t for t in api.to(OWNER)) == 1
+        assert sum("Claude funziona di nuovo" in t for t in api.to(OWNER)) == 1
+        assert sum(t == i18n.t("it", "stuck_notice") for t in api.to(OWNER)) == 1
+        for other in OTHER_OWNER_ACCOUNTS:
+            told = api.to(other)
+            assert not any("limite" in t or "Claude funziona" in t or t == i18n.t("it", "stuck_notice") for t in told)
+        assert say.notice_recipients(conn, dataclasses.replace(worker._cfg, owner_chat=999)) == [
+            (55, "it"), (77, "it"), (OWNER, "it")]
+
+
+def test_the_owners_main_chat_is_the_first_of_their_accounts():
+    saved = {key: os.environ.get(key) for key in ("ZOE_OWNER_IDS", "ZOE_HOME")}
+    with tempfile.TemporaryDirectory() as tmp:
+        try:
+            os.environ["ZOE_OWNER_IDS"], os.environ["ZOE_HOME"] = f"{OWNER} 77 55", tmp
+            cfg = Config.from_env(Path(tmp) / "none.env")
+        finally:
+            for key, value in saved.items():
+                if value is None:
+                    os.environ.pop(key, None)
+                else:
+                    os.environ[key] = value
+    assert cfg.owner_chat == OWNER and cfg.owner_ids == frozenset({OWNER, 55, 77})
 
 
 def test_a_reply_to_a_message_brings_its_text_and_time():
@@ -364,6 +422,16 @@ def test_a_resumed_turn_keeps_the_key_its_session_was_given():
         worker._handle(conn, store.claim_next(conn))
         assert len(runner.prompts) == 2 and api.files[-1][4] == video
         assert api.to(OWNER)[-1] == "Eccolo 👇"
+
+
+def test_a_caption_is_written_as_html_like_a_reply():
+    with tempfile.TemporaryDirectory() as tmp:
+        photo = Path(tmp) / "foto.jpg"
+        photo.write_bytes(b"data")
+        caption = "<b>Mia</b> &amp; Alex.\nSeconda & ultima."
+        conn, owner, worker, _, api = worker_setup(Path(tmp), f"Eccola 👇\n[[{{k}} send: {photo} | {caption}]]")
+        _say(conn, worker, owner, 5, "mandami la foto")
+        assert [(f[2], f[4]) for f in api.files] == [("<b>Mia</b> &amp; Alex.\nSeconda &amp; ultima.", photo)]
 
 
 def test_a_reply_that_could_not_be_delivered_is_delivered_again_without_a_new_turn():

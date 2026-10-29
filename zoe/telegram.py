@@ -12,6 +12,7 @@ import threading
 import time
 import urllib.parse
 import uuid
+from collections.abc import Callable
 from pathlib import Path
 
 log = logging.getLogger("zoe.telegram")
@@ -102,6 +103,17 @@ def _mime(name: str) -> str:
     return mimetypes.guess_type(name)[0] or "application/octet-stream"
 
 
+def _html_or_plain(send: Callable[[dict], object], fields: dict) -> object:
+    """Send with ``fields``, whose text or caption has a parse mode, and again as plain text if Telegram
+    rejects the markup."""
+    try:
+        return send(fields)
+    except TelegramError as exc:
+        if "parse_mode" not in fields or "can't parse entities" not in str(exc):
+            raise
+        return send({k: v for k, v in fields.items() if k != "parse_mode"})
+
+
 def _reply_parameters(message_id: int) -> str:
     """Answer a message; if it no longer exists, the message is sent without the reply."""
     return json.dumps({"message_id": message_id, "allow_sending_without_reply": True})
@@ -156,12 +168,8 @@ class TelegramAPI:
             params["reply_markup"] = json.dumps({"inline_keyboard": buttons})
         if reply_to:
             params["reply_parameters"] = _reply_parameters(reply_to)
-        try:
-            return self._call("sendMessage", {**params, "parse_mode": parse_mode}, timeout=30)
-        except TelegramError as exc:
-            if "can't parse entities" not in str(exc):
-                raise
-            return self._call("sendMessage", params, timeout=30)
+        return _html_or_plain(lambda fields: self._call("sendMessage", fields, timeout=30),
+                              {**params, "parse_mode": parse_mode})
 
     def notify(self, chat_id: int, text: str, buttons: list[list[dict]] | None = None) -> bool:
         """Send a service message; a failure is logged and never interrupts the caller."""
@@ -209,27 +217,36 @@ class TelegramAPI:
         self, chat_id: int, kind: str, caption: str = "", file_id: str | None = None, path: Path | None = None,
         silent: bool = False, name: str = "",
     ) -> dict:
-        """Send a file as its kind (photo, video, document...): by a Telegram file id, or uploaded from
+        """Send a file as its kind (photo, video, document...), its caption in HTML: by a Telegram file id, or uploaded from
         ``path`` under ``name``, its own name when not given."""
         method, field = _SENDERS.get(kind, _SENDERS["document"])
         fields: dict[str, object] = {"chat_id": chat_id}
         if silent:
             fields["disable_notification"] = "true"
         if caption and kind != "sticker":
-            fields["caption"] = caption[:CAPTION_LIMIT]
-        if file_id:
-            return self.call(method, **fields, **{field: file_id})
-        name = name or path.name
-        return self._upload(method, fields, [(field, name, path.read_bytes(), _mime(name))])
+            fields.update(caption=caption[:CAPTION_LIMIT], parse_mode="HTML")
+        name = name or (path.name if path else "")
+
+        def send(fields: dict) -> dict:
+            if file_id:
+                return self.call(method, **fields, **{field: file_id})
+            return self._upload(method, fields, [(field, name, path.read_bytes(), _mime(name))])
+
+        return _html_or_plain(send, fields)
 
     def send_album(self, chat_id: int, items: list[tuple[str, Path]], caption: str = "") -> list[dict]:
         """Send 2 to 10 files as one album, each uploaded as its kind (photos and videos together,
-        or documents together), the caption under the first; return the messages it took."""
+        or documents together), the caption in HTML under the first; return the messages it took."""
         media = [{"type": kind, "media": f"attach://f{n}"} for n, (kind, _) in enumerate(items)]
         if caption:
-            media[0]["caption"] = caption[:CAPTION_LIMIT]
+            media[0].update(caption=caption[:CAPTION_LIMIT], parse_mode="HTML")
         uploads = [(f"f{n}", path.name, path.read_bytes(), _mime(path.name)) for n, (_, path) in enumerate(items)]
-        return self._upload("sendMediaGroup", {"chat_id": chat_id, "media": json.dumps(media)}, uploads)
+
+        def send(first: dict) -> list[dict]:
+            return self._upload("sendMediaGroup", {"chat_id": chat_id, "media": json.dumps([first, *media[1:]])},
+                                uploads)
+
+        return _html_or_plain(send, media[0])
 
     def send_voice(
         self, chat_id: int, audio: bytes, filename: str = "voice.ogg", reply_to: int | None = None, caption: str = ""

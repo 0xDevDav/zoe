@@ -11,7 +11,7 @@ from pathlib import Path
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 
-from fakes import OWNER, FakeAPI, FakeRunner, message, press, shown, targets, worker_setup
+from fakes import OTHER_OWNER_ACCOUNTS, OWNER, FakeAPI, FakeRunner, message, press, shown, targets, worker_setup
 from zoe import access, app, claude_runner, minds, plugins, store
 from zoe.brain import Brain
 from zoe.claude_runner import Result, Step
@@ -179,6 +179,21 @@ def test_a_mind_that_meets_a_usage_limit_waits_queued_and_resumes_its_session_af
         assert (event.kind, event.payload["event"]) == ("mind", "done")
         assert not any(t.startswith("🔀") for t in api.to(OWNER))
         conn.close()
+
+
+def test_a_mind_that_meets_a_usage_limit_tells_only_the_owners_main_chat():
+    with tempfile.TemporaryDirectory() as tmp:
+        conn, owner, worker, _, _ = worker_setup(Path(tmp), on_disk=True, others=OTHER_OWNER_ACCOUNTS)
+        minds.start(conn, Brain(conn, owner.id), owner, OWNER, "Report", "Prepara il report", "", [], Path(tmp))
+        engine = _engine(worker, OutOfUsage())
+        _run_mind(conn, engine)
+        store.set_state(conn, claude_runner.RETRY_AT, "0")
+        _run_mind(conn, engine)
+        notices = [(r["chat_id"], r["text"]) for r in conn.execute("SELECT chat_id, text FROM outbox ORDER BY id")]
+        assert [chat for chat, _ in notices] == [OWNER, OWNER]
+        assert "riprendo alle <b>" in notices[0][1] and "Claude funziona di nuovo" in notices[1][1]
+        conn.close()
+
 
 class NoteDuringRun:
     """A run that receives a note while working, then finishes on the resumed session."""

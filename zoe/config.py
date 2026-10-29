@@ -58,6 +58,7 @@ class Config:
     vault_key_path: Path
     workdir: Path
     owner_name: str = "Owner"
+    # The first of ZOE_OWNER_IDS, which keeps their order: the owner's main chat, where Zoe's own notices go.
     owner_chat: int | None = None
     bot_name: str = "Zoe"
     bot_photo: Path | None = None

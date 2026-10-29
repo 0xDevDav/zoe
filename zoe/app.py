@@ -11,7 +11,7 @@ import threading
 import time
 from pathlib import Path
 
-from . import access, bot_setup, claude_runner, health, i18n, instance, meaning, notices, plugins, store
+from . import access, bot_setup, claude_runner, health, i18n, instance, meaning, notices, plugins, say, store
 from .brain import Brain
 from .config import Config
 from .db import apply_schema, connect
@@ -74,7 +74,7 @@ def _speaker(cfg: Config, vault: Vault) -> Speaker | None:
 
 def _deliver_notices(cfg: Config, api: TelegramAPI, conn: sqlite3.Connection) -> None:
     pending = notices.drain(cfg.data_dir)
-    for owner_id, language in access.owner_recipients(conn):
+    for owner_id, language in say.notice_recipients(conn, cfg):
         for notice in pending:
             api.notify(owner_id, i18n.t(language, notice["key"], **notice["params"]))
 

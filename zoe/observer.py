@@ -268,7 +268,8 @@ class Observer(threading.Thread):
         prompt = build_prompt(person, rows, _known(brain, rows), signals.trends(conn, person.id, now=now))
         result = self._runner.run(prompt, self._profile)
         if not result.ok:
-            log.warning("observer run for person %d failed (rc=%s)", person.id, result.returncode)
+            log.warning("observer run for person %d failed (rc=%s): %s", person.id, result.returncode,
+                        result.failure[:200])
             self._retry_at[person.id] = now + _RETRY_AFTER
             return False
         try:

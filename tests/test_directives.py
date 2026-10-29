@@ -97,6 +97,27 @@ def test_parallel_minds_are_started_told_and_stopped():
     assert ask(extract("Trovati 12.\n[[{k} ask: Solo Italia?]]")[1]) == "Solo Italia?"
 
 
+def test_a_value_may_span_lines_up_to_the_next_directive():
+    reply, found = extract("Ecco 👇\n[[{k} send: /a/1.png, /a/2.png | Riga uno.\nRiga due.]]\n[[{k} used: 3]]")
+    assert reply == "Ecco 👇" and directives.sends(found) == [("/a/1.png, /a/2.png", "Riga uno.\nRiga due.", False)]
+    assert directives.used(found) == [3]
+
+
+def test_a_keyed_line_that_never_closes_is_never_shown_and_does_nothing():
+    reply, found = extract("Fatto.\n[[{k} react: 👍\n[[{k} used: 3]]\nA dopo [[{k} send: /a/1.png")
+    assert reply == "Fatto.\n\nA dopo" and found == [("used", "3")]
+    assert extract("Si scrive `[[{k} react: 👍`")[0] == f"Si scrive `[[{KEY} react: 👍`"
+
+
+def test_a_value_may_hold_the_closing_brackets_on_its_last_line():
+    note = "chiudi con ]] alla fine, poi (\"]]\") e basta."
+    reply, found = extract(f"Ok.\n\n[[{{k}} tell: 3 | {note}]]\n[[{{k}} used: 7]]")
+    assert reply == "Ok." and tells(found) == [(3, note)] and directives.used(found) == [7]
+    for text in ("grazie\nvedi [[nota]]", "vedi [[nota]]", "vedi [[nota]]\n[[{k} used: 7]]"):
+        reply, found = extract(f"Ok [[{{k}} react: 👍]] {text}")
+        assert reply.startswith(f"Ok  {text.split(chr(10))[0]}") and "[[nota]]" in reply and reaction(found) == "👍"
+
+
 def test_a_note_may_hold_brackets_and_code():
     note = ("Testo non selezionabile: `* { user-select: none; }` tranne input, textarea, [contenteditable], "
             "[contenteditable] * e l'elenco [a]")

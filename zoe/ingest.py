@@ -14,7 +14,7 @@ import sqlite3
 import threading
 import time
 
-from . import access, approve, choices, i18n, receipts, store
+from . import access, approve, choices, i18n, receipts, say, store
 from .config import Config
 from .db import connect
 from .menu import Menu
@@ -75,7 +75,7 @@ class Poller(threading.Thread):
         """Handle one batch of updates and return the offset after the last one handled.
 
         An update that fails is tried again with the next batch, so a passing error loses
-        nothing; after ``UPDATE_TRIES`` failures it is set aside and the owners are told.
+        nothing; after ``UPDATE_TRIES`` failures it is set aside and the owner is told.
         """
         updates = self._api.get_updates(offset, self._cfg.poll_timeout)
         self.polled = time.time()
@@ -97,7 +97,7 @@ class Poller(threading.Thread):
 
     def _lost(self, conn: sqlite3.Connection) -> None:
         try:
-            for owner_id, language in access.owner_recipients(conn):
+            for owner_id, language in say.notice_recipients(conn, self._cfg):
                 self._api.notify(owner_id, i18n.t(language, "update_lost"))
         except Exception:
             log.exception("owners not told about a lost update")
@@ -107,12 +107,12 @@ class Poller(threading.Thread):
         return now - self.beat < self._cfg.poll_timeout + 120
 
     def conflict(self, conn: sqlite3.Connection) -> None:
-        """Tell the owners, at most once an hour, that another program reads this bot's messages."""
+        """Tell the owner, at most once an hour, that another program reads this bot's messages."""
         if time.monotonic() - self._conflict_told < 3600:
             return
         self._conflict_told = time.monotonic()
         log.error("another program is reading this bot's updates: some messages may reach it instead")
-        for owner_id, language in access.owner_recipients(conn):
+        for owner_id, language in say.notice_recipients(conn, self._cfg):
             self._api.notify(owner_id, i18n.t(language, "poll_conflict"))
 
     def process(self, conn: sqlite3.Connection, update: dict) -> None:

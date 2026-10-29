@@ -99,8 +99,33 @@ def test_an_album_uploads_every_file_in_one_request():
     method, body = sent[0]
     assert method == "sendMediaGroup" and b"PNG-DATA" in body and b'name="f1"; filename="clip.mp4"' in body
     media = json.loads(body.split(b'name="media"\r\n\r\n')[1].split(b"\r\n")[0])
-    assert media == [{"type": "photo", "media": "attach://f0", "caption": "la card"},
+    assert media == [{"type": "photo", "media": "attach://f0", "caption": "la card", "parse_mode": "HTML"},
                      {"type": "video", "media": "attach://f1"}]
+
+
+def test_a_caption_is_html_and_goes_as_plain_text_when_telegram_rejects_its_markup():
+    sent = []
+
+    def send(path, body, headers, method, timeout):
+        sent.append((method, body))
+        if b"parse_mode" in body and (b"<b>rotto" in body or b"%3Cb%3Erotto" in body):
+            raise TelegramError(f"{method} rejected: Bad Request: can't parse entities")
+        return [{}, {}] if method == "sendMediaGroup" else {"message_id": 3}
+
+    api = TelegramAPI("t")
+    api._send = send
+    with tempfile.TemporaryDirectory() as tmp:
+        shot, clip = Path(tmp) / "shot.png", Path(tmp) / "clip.mp4"
+        shot.write_bytes(b"PNG-DATA")
+        clip.write_bytes(b"MP4-DATA")
+        api.send_file(5, "photo", "<b>Mia</b> su Blu&amp;Red", path=shot)
+        api.send_album(5, [("photo", shot), ("video", clip)], "<b>rotto")
+        api.send_file(5, "photo", "<b>rotto", file_id="abc")
+    assert b'name="parse_mode"\r\n\r\nHTML' in sent[0][1] and b"<b>Mia</b> su Blu&amp;Red" in sent[0][1]
+    assert [method for method, _ in sent[1:]] == ["sendMediaGroup", "sendMediaGroup", "sendPhoto", "sendPhoto"]
+    first = json.loads(sent[2][1].split(b'name="media"\r\n\r\n')[1].split(b"\r\n")[0])[0]
+    assert first["caption"] == "<b>rotto" and "parse_mode" not in first
+    assert b"parse_mode" in sent[3][1] and b"parse_mode" not in sent[4][1] and b"photo=abc" in sent[4][1]
 
 
 def test_an_address_that_does_not_answer_costs_seconds_not_the_request_timeout():

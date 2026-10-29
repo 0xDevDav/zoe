@@ -2,7 +2,9 @@
 
 from __future__ import annotations
 
+import contextlib
 import json
+import logging
 import re
 import sqlite3
 import threading
@@ -16,10 +18,29 @@ from zoe.telegram import TelegramError
 from zoe.worker import Worker
 
 OWNER = 111
+OTHER_OWNER_ACCOUNTS = (55, 77)
+
+
+FAKE_FAILURE = "Something broke on the way"
+
+
+@contextlib.contextmanager
+def logged(name: str):
+    """The lines a logger writes while the block runs."""
+    lines: list[str] = []
+    handler = logging.Handler()
+    handler.emit = lambda record: lines.append(record.getMessage())
+    logger = logging.getLogger(name)
+    logger.addHandler(handler)
+    try:
+        yield lines
+    finally:
+        logger.removeHandler(handler)
 
 
 class FakeRunner:
-    """Answers each turn with the next prepared reply, or fails when the reply is None.
+    """Answers each turn with the next prepared reply, or fails with Claude's own words
+    ``FAKE_FAILURE`` when the reply is None.
     Every turn belongs to the same session. A reply writes its directives with {k},
     which becomes the key the prompt gave, as Claude would write them."""
 
@@ -37,13 +58,14 @@ class FakeRunner:
         if reply and key:
             reply = reply.replace("{k}", key.group(1))
         return Result(reply is not None, reply or "", False, False, 0 if reply is not None else 1, 1.0,
-                      session_id="session-1")
+                      session_id="session-1", failure="" if reply is not None else FAKE_FAILURE)
 
 
 def worker_setup(
-    home: Path, *replies: str | None, on_disk: bool = False
+    home: Path, *replies: str | None, on_disk: bool = False, others: tuple[int, ...] = ()
 ) -> tuple[sqlite3.Connection, access.Person, Worker, FakeRunner, FakeAPI]:
     """A database with one owner, and a worker whose Claude gives the prepared replies. The
+    owner writes from ``OWNER``, their main chat, and from the ``others`` accounts too. The
     database lives in ``home`` when other threads must open it too."""
     if on_disk:
         conn = connect(home / "zoe.db")
@@ -51,10 +73,11 @@ def worker_setup(
         conn = sqlite3.connect(":memory:", check_same_thread=False)
         conn.row_factory = sqlite3.Row
     apply_schema(conn)
-    owner = access.bootstrap_owner(conn, frozenset({OWNER}), "Alex", "it")
+    owner = access.bootstrap_owner(conn, frozenset({OWNER, *others}), "Alex", "it")
     cfg = Config(
-        bot_token="", owner_ids=frozenset({OWNER}), data_dir=home, db_path=home / "zoe.db",
+        bot_token="", owner_ids=frozenset({OWNER, *others}), data_dir=home, db_path=home / "zoe.db",
         vault_path=home / "v.db", vault_key_path=home / "v.key", workdir=home, default_language="it",
+        owner_chat=OWNER,
     )
     api, runner = FakeAPI(), FakeRunner(*replies)
     worker = Worker(cfg, api, threading.Event())

@@ -11,7 +11,7 @@ from pathlib import Path
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 
-from fakes import OWNER, FakeAPI, FakeRunner, targets, worker_setup
+from fakes import FAKE_FAILURE, OWNER, FakeAPI, FakeRunner, logged, targets, worker_setup
 from zoe import access, observer, prompt, signals, store, vocabulary
 from zoe.brain import Brain
 from zoe.ingest import Poller
@@ -118,7 +118,9 @@ def test_the_observer_reads_a_paused_conversation_once_and_retries_a_failed_run(
             "signals": [{"kind": "stress", "value": 4, "note": "colloquio", "message": 7}],
             "memories": [{"kind": "goal", "content": "Cerca un nuovo lavoro", "replaces": None, "messages": [7]}],
         }))
-        assert not watcher.observe(conn, owner, 2000.0)
+        with logged("zoe.observer") as lines:
+            assert not watcher.observe(conn, owner, 2000.0)
+        assert any(FAKE_FAILURE in line for line in lines), lines
         assert observer.unread(conn, owner.id) and not watcher.observe(conn, owner, 2100.0)
         assert watcher.observe(conn, owner, 2000.0 + 900.0)
         assert "[#7]" in watcher._runner.prompts[-1] and "Alex: Domani ho il colloquio" in watcher._runner.prompts[-1]

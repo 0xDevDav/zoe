@@ -61,6 +61,8 @@ class Result:
     refused: str = ""
     # What Claude itself said when it could not work: its error result and the end of its stderr.
     failure: str = ""
+    # The error code Claude put on its own message when it could not answer, such as "rate_limit".
+    error_code: str = ""
     # The session still at work in the background after this answer, when the turn asked for it.
     later: Later | None = None
 
@@ -73,15 +75,20 @@ RETRY_AT = "claude_retry_at"
 _UNAVAILABLE = ("/login", "not logged in", "invalid api key", "oauth token", "authentication_error",
                 "usage limit", "limit reached", "hit your limit", "you've hit your", "session limit",
                 "weekly limit", "credit balance")
+# Error codes Claude puts on its message for the same failures, whatever the words say.
+_UNAVAILABLE_CODES = {"authentication_failed", "rate_limit", "billing_error", "oauth_org_not_allowed"}
 
 
 def unavailable(result: Result) -> str:
     """Why Claude cannot work at all, from its own error (never from what the turn wrote), or ""."""
     if result.ok:
         return ""
-    for line in result.failure.splitlines():
+    lines = [line.strip() for line in result.failure.splitlines() if line.strip()]
+    for line in lines:
         if any(word in line.lower() for word in _UNAVAILABLE):
-            return line.strip()[:200]
+            return line[:200]
+    if result.error_code in _UNAVAILABLE_CODES:
+        return (lines[0] if lines else result.error_code)[:200]
     return ""
 
 
@@ -275,6 +282,7 @@ class _Session:
         self._errors: deque[str] = deque(maxlen=20)
         self.session_id = ""
         self.refused = ""
+        self.error_code = ""
         self._readers = [threading.Thread(target=self._read_events, daemon=True),
                          threading.Thread(target=self._read_errors, daemon=True)]
         for reader in self._readers:
@@ -299,6 +307,8 @@ class _Session:
                 continue
             if event.get("session_id"):
                 self.session_id = event["session_id"]
+            if event.get("type") == "assistant" and event.get("error"):
+                self.error_code = str(event["error"])
             if event.get("subtype") == "init" and self._profile.tools is not None:
                 self.refused = beyond(event, self._profile.tools)
             if event.get("type") == "result":
@@ -434,6 +444,7 @@ class _Session:
             cancelled=stop == "cancelled",
             refused=self.refused,
             failure="\n".join(([answer.text] if error else []) + list(self._errors)),
+            error_code=self.error_code,
             later=later,
         )
 

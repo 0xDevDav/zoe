@@ -74,6 +74,10 @@ else gets an answer until the owner lets them in:
   turns can then read it, and only read it, besides their own folder. Zoe's
   home, her code, the root of a disk and the home folder itself are never shared.
 
+The first id in `ZOE_OWNER_IDS` is the owner's main chat: Zoe's own notices
+(Claude out of usage and back, a stuck or refused turn, a lost message) go only
+there, whichever account the owner writes from (`say.notice_recipients`).
+
 ## Menu
 
 The menu is a Telegram Mini App (`menu.py`, served by `webapp.py`), so the chat
@@ -189,6 +193,12 @@ instructions hold, and a directive counts only with that key: `[[KEY react: 👍
 A web page, an email, a file or a message Zoe reads cannot know the key, so a
 directive written there and repeated in a reply stays plain, visible text and
 does nothing. Directives inside code never act either.
+
+A value may span lines, such as a caption of two lines, never past the next
+directive. It ends at the `]]` that closes its line, so it may hold `]]` on that
+line, unless it opens `[[` too: then it ends at its first `]]`, as a directive
+written within a line does. A keyed line that is
+no known directive, or never closes, is a slip: it does nothing and is never shown.
 
 Whatever a reply sets in motion (plans made or cancelled, files kept or deleted,
 people admitted) is listed after it in a silent receipt written by the service,
@@ -453,7 +463,7 @@ only in instructions:
 - **Prompts travel through stdin**, never on the command line, where they would
   be capped and readable by every local user.
 - **Parts that fail come back.** An update that fails is retried and, if it
-  keeps failing, set aside with a notice to the owners; a worker survives any
+  keeps failing, set aside with a notice to the owner; a worker survives any
   error in a turn; a part of the service that stops makes the whole service
   exit, and the launcher starts it again.
 - **Work is not repeated.** A turn that runs too long or goes silent resumes
@@ -474,13 +484,16 @@ only in instructions:
   holds the turn for two minutes at most: Claude Code then moves it to the
   background, where it is followed the same way.
 - **When Claude cannot work at all** (logged out, out of usage), which its own
-  error says, never what a turn wrote: turns go back to the queue without
+  error says, never what a turn wrote: by its words, or by the error code Claude
+  puts on its message (`authentication_failed`, `rate_limit`, `billing_error`,
+  `oauth_org_not_allowed`) whatever the words. Turns go back to the queue without
   counting as attempts, and working parallel minds go back to theirs with
   their session, without spending their retry. Nothing starts again before
   the retry moment: when a usage limit resets, as its error says ("resets
-  6pm"), otherwise a minute later. The owners hear it once, with the time
+  6pm"), otherwise a minute later. The owner hears it once, with the time
   Zoe resumes or the reason, then again when Claude is back
-  (`availability.py`).
+  (`availability.py`). Any other failed run logs the start of Claude's own
+  error, so a new kind of failure leaves its words in the journal.
 - **Long messages cannot flood the memory:** a message teaches the speech
   glossary at most 15 words, pasted code and logs none.
 
@@ -489,7 +502,7 @@ only in instructions:
 - **One Zoe per home.** The service holds a lock on `ZOE_HOME/zoe.lock` while
   it runs, and a second one refuses to start, so two services never split the
   bot's messages. If something else reads the bot's updates with the same
-  token, Telegram reports a conflict and the owners are told, at most once an
+  token, Telegram reports a conflict and the owner is told, at most once an
   hour.
 - **One turn per chat.** Messages are claimed from the database one chat at a
   time, a turn takes in only its own chat's messages, and a turn that fails
@@ -591,8 +604,9 @@ keeping (`files.py`):
   up to Telegram's 50 MB. Several files separated by commas arrive together as
   albums of up to ten, logged in the chat like any file: photos and videos as
   such, or all as documents when one is neither. `| file` at the end sends them
-  uncompressed, as documents, when the originals matter. A member keeps and
-  sends only files in their own folder.
+  uncompressed, as documents, when the originals matter. The caption is HTML
+  formatted like a reply, and goes as plain text only when Telegram rejects its
+  markup. A member keeps and sends only files in their own folder.
 
 ## Voice
 

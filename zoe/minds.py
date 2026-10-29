@@ -462,10 +462,10 @@ class Minds(threading.Thread):
                 # Claude cannot work at all: the mind waits in the queue with its session and
                 # resumes it once Claude can, without spending its one retry.
                 conn.execute("UPDATE minds SET state = 'queued' WHERE id = ? AND state = 'running'", (mind_id,))
-                availability.down(conn, self._cfg.data_dir, reason)
+                availability.down(conn, self._cfg, reason)
                 log.warning("parallel mind %d waits for Claude: %s", mind_id, reason)
                 return
-            availability.works(conn, self._cfg.data_dir)
+            availability.works(conn, self._cfg)
             if result.ok:
                 report, found = directives.extract(result.text, mind.directive_key)
                 question = directives.ask(found)

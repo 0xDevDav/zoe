@@ -73,20 +73,39 @@ def keyed(text: str, key: str) -> str:
     return text.replace("{k}", key)
 
 
-def extract(reply: str, key: str) -> tuple[str, list[tuple[str, str]]]:
-    """Return the reply without its directives, and the (name, value) pairs found.
-
-    Only directives with ``key`` count, and none inside code: those stay in the text as written.
-    """
+def _patterns(key: str) -> list[re.Pattern]:
+    """The shapes of a directive written with ``key``, in the order they are preferred where several
+    start at the same place."""
     k = re.escape(key)
     # A block carries a text that may span lines and hold any text, up to its closing tag; a mind
     # always has a title and a forward never has one.
-    block = re.compile(rf"\[\[\s*{k}\s+(?P<name>mind(?=\s*:)|forward(?!\s*:))(?:\s*:\s*(?P<head>[^\]]+?))?\s*\]\](?P<body>.*?)"
-                       rf"\[\[\s*(?:{k}\s+)?/(?P=name)\s*\]\]", re.IGNORECASE | re.DOTALL)
-    # A value may hold brackets and code (CSS selectors, a snippet): it ends at the last "]]" of a run.
-    single = re.compile(rf"\[\[\s*{k}\s+({_NAMES})\s*(?::\s*(.*?))?\s*\]\](?!\])", re.IGNORECASE)
-    # Only Claude knows the key, so a keyed line that is no known directive is a slip: it is never shown.
-    stray = re.compile(rf"\[\[\s*{k}\b(.*?)\]\](?!\])", re.IGNORECASE)
+    block = (rf"\[\[\s*{k}\s+(?P<name>mind(?=\s*:)|forward(?!\s*:))(?:\s*:\s*(?P<head>[^\]]+?))?\s*\]\]"
+             rf"(?P<body>.*?)\[\[\s*(?:{k}\s+)?/(?P=name)\s*\]\]")
+    # A value may hold brackets and code (CSS selectors, a snippet) and span lines (a caption, a plan's
+    # instruction), never past the next directive. It ends at the "]]" that closes its line and may hold
+    # "]]" on that last line, unless it opens "[[" too: then, as within a line, it ends at its first "]]".
+    closes_line = r"\]\](?=[ \t]*(?:\n|$))"
+    first = r"\]\](?!\])"
+    lined = rf"(?:(?!\[\[)(?!\]\](?![^\n]*{closes_line})).)*?"
+    inline = rf"(?:(?!\[\[\s*{k}\b).)*?"
+
+    def known(value: str, end: str) -> str:
+        return rf"\[\[\s*{k}\s+(?P<name>{_NAMES})\s*(?::\s*(?P<value>{value}))?\s*{end}"
+
+    def stray(value: str, end: str) -> str:
+        return rf"\[\[\s*{k}\b(?P<value>{value}){end}"
+
+    # Only Claude knows the key, so a keyed line that is no known directive, or never closes, is a slip:
+    # it is never shown.
+    unclosed = rf"\[\[\s*{k}\b(?P<value>(?:(?!\[\[\s*{k}\b)[^\n])*)"
+    shapes = [block, known(lined, closes_line), known(inline, first), stray(lined, closes_line), stray(inline, first),
+              unclosed]
+    return [re.compile(shape, re.IGNORECASE | re.DOTALL) for shape in shapes]
+
+
+def _scan(reply: str, key: str) -> list[re.Match]:
+    """The directives of ``reply`` written with ``key``, in order, none inside code; a known directive
+    comes before a stray one at the same place, which is skipped."""
     code = [m.span() for m in _CODE.finditer(reply)]
 
     def outside(begin: int, end: int) -> bool:
@@ -94,32 +113,45 @@ def extract(reply: str, key: str) -> tuple[str, list[tuple[str, str]]]:
 
     def acts(match: re.Match) -> bool:
         # A directive acts when it opens and closes outside code: what it carries may hold code.
-        if match.re is block:
-            return outside(match.start(), match.start("body")) and outside(match.end("body"), match.end())
-        if match.re is stray:
-            return outside(match.start(), match.start(1)) and outside(match.end() - 2, match.end())
-        head = match.start(2) if match.group(2) is not None else match.end(1)
-        return outside(match.start(), head) and outside(match.end() - 2, match.end())
+        inner = "body" if "body" in match.re.groupindex else "value"
+        begin, end = match.span(inner) if match.group(inner) is not None else (match.end("name"),) * 2
+        return outside(match.start(), begin) and outside(end, match.end())
 
-    found: list[tuple[str, str]] = []
-    pieces, last = [], 0
-    # A known directive sorts before a stray one at the same place, so the stray one is skipped.
-    matches = [*block.finditer(reply), *single.finditer(reply), *stray.finditer(reply)]
+    matches = [m for pattern in _patterns(key) for m in pattern.finditer(reply)]
+    found, last = [], 0
     for match in sorted(matches, key=lambda m: m.start()):
-        if match.start() < last or not acts(match):
-            continue
-        if match.re is block:
-            name, body = match.group("name").lower(), match.group("body").strip()
-            found.append((name, f"{match.group('head') or ''}\n{body}" if name == "mind" else body))
-        elif match.re is stray:
-            log.warning("unknown directive removed: %s", match.group(0))
-        else:
-            found.append((match.group(1).lower(), match.group(2) or ""))
+        if match.start() >= last and acts(match):
+            found.append(match)
+            last = match.end()
+    return found
+
+
+def _without(reply: str, matches: list[re.Match]) -> str:
+    pieces, last = [], 0
+    for match in matches:
         pieces.append(reply[last:match.start()])
         last = match.end()
     pieces.append(reply[last:])
-    clean = re.sub(r"\n{3,}", "\n\n", "".join(pieces)).strip()
-    return clean, found
+    return re.sub(r"\n{3,}", "\n\n", "".join(pieces)).strip()
+
+
+def extract(reply: str, key: str) -> tuple[str, list[tuple[str, str]]]:
+    """Return the reply without its directives, and the (name, value) pairs found.
+
+    Only directives with ``key`` count, and none inside code: those stay in the text as written.
+    """
+    matches = _scan(reply, key)
+    found: list[tuple[str, str]] = []
+    for match in matches:
+        name = (match.groupdict().get("name") or "").lower()
+        if "body" in match.re.groupindex:
+            body = match.group("body").strip()
+            found.append((name, f"{match.group('head') or ''}\n{body}" if name == "mind" else body))
+        elif not name:
+            log.warning("directive not understood, removed: %s", match.group(0))
+        else:
+            found.append((name, match.group("value") or ""))
+    return _without(reply, matches), found
 
 
 def corrections(found: list[tuple[str, str]]) -> list[tuple[str, str]]:
