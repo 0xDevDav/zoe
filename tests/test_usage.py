@@ -43,11 +43,15 @@ def test_a_reading_runs_in_the_background_and_only_when_old():
 
     found = Usage(Config(bot_token="", owner_ids=frozenset(), data_dir=Path("."), db_path=Path("x"),
                          vault_path=Path("x"), vault_key_path=Path("x"), workdir=Path(".")), reader)
-    assert found.latest() == []
-    deadline = time.time() + 5
-    while not found.latest() and time.time() < deadline:
-        time.sleep(0.01)
-    assert found.latest() == [Limit("Current session", 10.0, None)] and len(readings) == 1
+    saved, claude_runner._reported = claude_runner._reported, ({}, 0.0)
+    try:
+        assert found.latest() == []
+        deadline = time.time() + 5
+        while not found.latest() and time.time() < deadline:
+            time.sleep(0.01)
+        assert found.latest() == [Limit("Current session", 10.0, None)] and len(readings) == 1
+    finally:
+        claude_runner._reported = saved
 
 
 def test_the_limits_a_run_reported_come_first_and_a_window_past_its_reset_is_unused():

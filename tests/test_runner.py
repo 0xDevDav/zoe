@@ -158,25 +158,34 @@ print(json.dumps({"type": "result", "result": os.environ.get("BASH_MAX_TIMEOUT_M
 
 
 def test_a_turn_that_answers_first_lets_no_command_hold_it_past_the_foreground_limit():
-    with tempfile.TemporaryDirectory() as tmp:
-        runner = ClaudeRunner(_claude(Path(tmp), ENV_CLAUDE), "model", hard_timeout=30, inactivity_timeout=20)
-        assert runner.run("ciao", Profile((), Path(tmp), {"A": "1"}), follow_for=60).text == "120000"
-        assert runner.run("ciao", Profile((), Path(tmp))).text == "none"
+    # Checks run from one of Zoe's own turns inherit the limit that turn was given.
+    inherited = os.environ.pop("BASH_MAX_TIMEOUT_MS", None)
+    try:
+        with tempfile.TemporaryDirectory() as tmp:
+            runner = ClaudeRunner(_claude(Path(tmp), ENV_CLAUDE), "model", hard_timeout=30, inactivity_timeout=20)
+            assert runner.run("ciao", Profile((), Path(tmp), {"A": "1"}), follow_for=60).text == "120000"
+            assert runner.run("ciao", Profile((), Path(tmp))).text == "none"
+    finally:
+        if inherited is not None:
+            os.environ["BASH_MAX_TIMEOUT_MS"] = inherited
 
 
 def test_events_of_unexpected_shapes_are_skipped():
     with tempfile.TemporaryDirectory() as tmp:
         failures = []
         hook, threading.excepthook = threading.excepthook, failures.append
+        saved = claude_runner.reported()
         try:
             steps = []
             runner = ClaudeRunner(_claude(Path(tmp), ODD_CLAUDE), "model", hard_timeout=30, inactivity_timeout=20)
             result = runner.run("ciao", Profile((), Path(tmp)), on_step=steps.append)
+            reported = claude_runner.reported()[0]
         finally:
             threading.excepthook = hook
+            claude_runner._reported = saved
         assert not failures, failures
         assert result.ok and result.text == "done" and result.session_id == "s-8", result
-        assert claude_runner.reported()[0] == {"unifiedWindows": {"five_hour": {"utilization": 0.11, "resetsAt": 4000000000}}}
+        assert reported == {"unifiedWindows": {"five_hour": {"utilization": 0.11, "resetsAt": 4000000000}}}
 
 
 def _failing(code: str, words: str) -> claude_runner.Result:

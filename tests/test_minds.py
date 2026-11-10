@@ -217,9 +217,12 @@ def test_a_note_interrupts_the_run_and_resumes_its_session_with_it():
     with tempfile.TemporaryDirectory() as tmp:
         conn, owner, worker, *_ = worker_setup(Path(tmp), on_disk=True)
         mind_id = minds.start(conn, Brain(conn, owner.id), owner, OWNER, "Sito", "Crea il sito", "", [], Path(tmp))
-        minds._WATCH_EVERY = 0.05
+        every, minds._WATCH_EVERY = minds._WATCH_EVERY, 0.05
         runner = NoteDuringRun(Path(tmp), owner.id, mind_id)
-        _run_mind(conn, _engine(worker, runner))
+        try:
+            _run_mind(conn, _engine(worker, runner))
+        finally:
+            minds._WATCH_EVERY = every
         assert len(runner.prompts) == 2 and "Aggiungi anche la pagina contatti" in runner.prompts[1]
         assert minds.get(conn, mind_id).state == "done"
         conn.close()

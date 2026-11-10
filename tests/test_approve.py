@@ -213,10 +213,13 @@ class AsksDuringTheTurn:
 def test_the_answer_comes_after_the_question_asked_during_the_turn():
     with tempfile.TemporaryDirectory() as tmp:
         conn, owner, worker, _, api = worker_setup(Path(tmp))
-        worker_module.FOLLOWUP_POLL = 0.05
+        poll, worker_module.FOLLOWUP_POLL = worker_module.FOLLOWUP_POLL, 0.05
         worker._runner = AsksDuringTheTurn(conn, api)
         store.enqueue(conn, OWNER, owner.id, "pubblica", "text")
-        worker._handle(conn, store.claim_next(conn))
+        try:
+            worker._handle(conn, store.claim_next(conn))
+        finally:
+            worker_module.FOLLOWUP_POLL = poll
         texts = [text for _, text, _ in api.sent]
         assert "Al lavoro" in texts[0] and texts[1] == "🔐 Posso farlo?" and "Al lavoro" in texts[2]
         assert (OWNER, api.sent_ids[0]) in api.deleted and api.to(OWNER)[-1] == "Fatto ✅"

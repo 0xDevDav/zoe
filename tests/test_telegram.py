@@ -19,6 +19,16 @@ from zoe.telegram import TelegramAPI, TelegramError
 
 EXCHANGE = telegram._exchange
 
+# What the checks below replace, put back after each one so no other check runs with them.
+_REPLACED = {name: getattr(telegram, name) for name in ("_exchange", "_Connection", "_kept", "CONNECT_TIMEOUT")}
+_SLEEP = time.sleep
+
+
+def teardown_function(function: object = None) -> None:
+    for name, value in _REPLACED.items():
+        setattr(telegram, name, value)
+    time.sleep = _SLEEP
+
 
 def _answers(*outcomes: object) -> list[str]:
     """Make Telegram give these outcomes in turn: an error raised, raw bytes, a (status, answer)
@@ -203,7 +213,10 @@ def test_telegram_is_reached_only_over_a_verified_connection():
 def _run() -> None:
     for name, fn in sorted(globals().items()):
         if name.startswith("test_") and callable(fn):
-            fn()
+            try:
+                fn()
+            finally:
+                teardown_function(fn)
             print(f"ok  {name}")
 
 
