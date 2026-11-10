@@ -33,7 +33,7 @@ from . import access, i18n
 from .claude_runner import Profile
 from .config import Config
 from .db import connect
-from .telegram import TelegramAPI
+from .telegram import TelegramAPI, TelegramError
 
 log = logging.getLogger("zoe.approve")
 
@@ -43,6 +43,9 @@ MIND = "ZOE_MIND"
 WAIT = 600.0
 _POLL = 1.0
 _SHOWN = 600
+# Seconds the chat stays quiet before a question moves below the messages that came after it,
+# so a burst of messages moves it once.
+SETTLE = 3.0
 
 
 def rules(home: Path) -> list[str]:
@@ -158,18 +161,50 @@ def _text(conn: sqlite3.Connection, row: sqlite3.Row, outcome: str = "") -> str:
     return f"{asked}\n\n{ending}"
 
 
+def _buttons(conn: sqlite3.Connection, row: sqlite3.Row) -> list[list[dict]]:
+    lang = _language(conn, row["chat_id"])
+    return [[{"text": i18n.t(lang, "btn_allow"), "callback_data": f"a:allow:{row['id']}", "style": "success"},
+             {"text": i18n.t(lang, "btn_deny"), "callback_data": f"a:deny:{row['id']}", "style": "danger"}]]
+
+
+def _retire(api: TelegramAPI, chat_id: int, message_id: int, text: str) -> None:
+    """Delete a message, or leave ``text`` in it without buttons when Telegram keeps it."""
+    if not api.delete_message(chat_id, message_id):
+        api.edit_message(chat_id, message_id, text)
+
+
+def _move(conn: sqlite3.Connection, api: TelegramAPI, row: sqlite3.Row) -> None:
+    """Ask a waiting question again at the bottom of the chat and retire the message that asked it
+    before, so only one of them has buttons; when the owner answered meanwhile, the new one goes."""
+    sent = api.send_message(row["chat_id"], _text(conn, row), buttons=_buttons(conn, row))
+    moved = conn.execute("UPDATE approvals SET message_id = ? WHERE id = ? AND state = 'waiting'",
+                         (sent.get("message_id"), row["id"])).rowcount
+    if moved:
+        _retire(api, row["chat_id"], row["message_id"], i18n.t(_language(conn, row["chat_id"]), "approval_moved"))
+    else:
+        answered = conn.execute("SELECT * FROM approvals WHERE id = ?", (row["id"],)).fetchone()
+        _retire(api, row["chat_id"], sent.get("message_id"), _text(conn, answered, answered["state"]))
+
+
 def deliver(conn: sqlite3.Connection, api: TelegramAPI, now: float | None = None) -> None:
-    """Ask the questions not asked yet, and close the ones nobody answered in time, even when
-    the hook that waited for them is gone."""
+    """Ask the questions not asked yet, move a waiting one below the messages that reached its chat
+    after it once the chat is quiet for SETTLE seconds, and close the ones nobody answered in time,
+    even when the hook that waited for them is gone."""
     now = time.time() if now is None else now
     conn.execute("UPDATE approvals SET state = 'expired', answered_at = ? WHERE state = 'waiting' AND created_at < ?",
                  (now, now - WAIT - 30))
-    for row in conn.execute("SELECT * FROM approvals WHERE state = 'waiting' AND message_id IS NULL").fetchall():
-        lang = _language(conn, row["chat_id"])
-        buttons = [[{"text": i18n.t(lang, "btn_allow"), "callback_data": f"a:allow:{row['id']}", "style": "success"},
-                    {"text": i18n.t(lang, "btn_deny"), "callback_data": f"a:deny:{row['id']}", "style": "danger"}]]
-        sent = api.send_message(row["chat_id"], _text(conn, row), buttons=buttons)
-        conn.execute("UPDATE approvals SET message_id = ? WHERE id = ?", (sent.get("message_id"), row["id"]))
+    for row in conn.execute("SELECT * FROM approvals WHERE state = 'waiting' ORDER BY id").fetchall():
+        if row["message_id"] is None:
+            sent = api.send_message(row["chat_id"], _text(conn, row), buttons=_buttons(conn, row))
+            conn.execute("UPDATE approvals SET message_id = ? WHERE id = ?", (sent.get("message_id"), row["id"]))
+            continue
+        latest = conn.execute("SELECT MAX(created_at) FROM messages WHERE chat_id = ? AND telegram_id > ?",
+                              (row["chat_id"], row["message_id"])).fetchone()[0]
+        if latest is not None and now - latest >= SETTLE:
+            try:
+                _move(conn, api, row)
+            except TelegramError as exc:
+                log.warning("question %d not moved: %s", row["id"], exc)
     for row in conn.execute(
         "SELECT * FROM approvals WHERE state = 'expired' AND settled = 0 AND message_id IS NOT NULL"
     ).fetchall():

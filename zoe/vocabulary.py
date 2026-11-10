@@ -18,7 +18,7 @@ from __future__ import annotations
 
 import re
 
-from . import i18n
+from . import i18n, secrets
 from .brain import Brain
 
 TERM = "term"
@@ -32,6 +32,8 @@ _MAX_LINES = 30
 
 def _is_term(word: str, sentence_start: bool) -> bool:
     if len(word) < 2 or word.lower() in _STOPWORDS or word.startswith(("http", "@", "/", "#", "<")) or "](" in word:
+        return False
+    if secrets.is_secret(word):
         return False
     if not any(c.isalpha() for c in word):
         return False

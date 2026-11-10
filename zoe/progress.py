@@ -126,6 +126,12 @@ class Progress:
         self._shown = ""
         self._thread = threading.Thread(target=self._loop, daemon=True)
 
+    @property
+    def started(self) -> bool:
+        """Whether the message has started to show. Steps taken before are kept, so it shows the
+        latest one when it starts."""
+        return self._thread.ident is not None
+
     def start(self) -> None:
         self._started = time.monotonic()
         self._api.send_chat_action(self._chat_id, self._action)

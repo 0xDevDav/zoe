@@ -1,8 +1,8 @@
 """Worker thread: turn one pending message into one reply.
 
 Several workers run side by side. Each takes a message, or a plan that came due
-or news from a parallel mind, which run like one without a progress message,
-opens the memory of the
+or news from a parallel mind, which run like one but show a progress message only
+once the person writes during them, opens the memory of the
 person who sent it, shows a live progress message while Claude works with that
 person's powers, then replaces it with the answer, formatted to the writing
 standard, in the chat the message came from, and records what was learned. A
@@ -19,11 +19,12 @@ import time
 from collections.abc import Callable
 from contextlib import closing
 from datetime import datetime
+from functools import partial
 from pathlib import Path
 
 from . import (
     access, approve, availability, choices, content, directives, files, formatting, i18n, minds, planner, prompt,
-    receipts, say, store, vocabulary,
+    receipts, say, secrets, store, vocabulary,
 )
 from .access import Person
 from .brain import Brain
@@ -147,15 +148,16 @@ class Worker(threading.Thread):
         if person.role == "owner":
             profile = approve.asking(profile, self._cfg.data_dir, msg.chat_id)
         key = directives.new_key()
-        # Plans and news from parallel minds show no progress: nobody is waiting for them,
-        # and a plan may end up sending nothing. A person sees it at once, before what they
-        # sent is downloaded or heard.
-        progress = None if internal else Progress(
+        # A person sees the progress at once, before what they sent is downloaded or heard. A plan
+        # or news from a parallel mind shows it only once the person writes, and takes their
+        # messages in as they come (``_watch``): nobody waits for it before, and a plan may end up
+        # sending nothing.
+        progress = Progress(
             self._api, msg.chat_id, person.language,
             "record_voice" if msg.kind == "voice" and self._speaker is not None else "typing",
         )
         try:
-            if progress:
+            if not internal:
                 progress.step(Step("working" if (msg.payload or {}).get("read") else _taking_in(msg.kind)))
                 progress.start()
             if (msg.payload or {}).get("group"):
@@ -165,8 +167,7 @@ class Worker(threading.Thread):
             if read:
                 self._answer(conn, brain, person, read, profile, key, progress)
         finally:
-            if progress:
-                progress.finish()
+            progress.finish()
 
     def _answer(
         self,
@@ -176,7 +177,7 @@ class Worker(threading.Thread):
         read: list[tuple[store.Message, str]],
         profile: Profile,
         key: str,
-        progress: Progress | None,
+        progress: Progress,
     ) -> None:
         first = read[0][0]
         spoken = first.kind == "voice" and self._speaker is not None
@@ -189,7 +190,7 @@ class Worker(threading.Thread):
                 plan=first.payload if first.kind == planner.PLAN else None,
                 mind=first.payload if first.kind == minds.EVENT else None,
                 reply=(first.payload or {}).get("reply"),
-                followups=[(m.telegram_id, text) for m, text in read[1:]], key=key,
+                followups=[(m.telegram_id, text, (m.payload or {}).get("reply")) for m, text in read[1:]], key=key,
                 temp_file_days=self._cfg.temp_file_days, archive=self._cfg.db_path,
             )
 
@@ -198,7 +199,7 @@ class Worker(threading.Thread):
             # The resumed session still holds the first try's prompt, so its key goes on.
             key = first.payload.get("key", key)
         prompt_text, recalled = fresh()
-        if progress and recalled.memories:
+        if recalled.memories:
             # The progress shows what Zoe remembers, as it shows the tools she uses.
             lasting = next((r.content for r in recalled.memories if r.kind != "episode"), "")
             progress.step(Step("recall", args={"memory": lasting}))
@@ -210,19 +211,22 @@ class Worker(threading.Thread):
             result, key = Result(True, stored["text"], False, False, 0, 0.0), stored["key"]
         else:
             result = self._converse(conn, brain, person, read, prompt_text, profile, progress, fresh, session)
+        sent = None
         try:
-            self._finish(conn, brain, person, read, recalled, result, spoken, key, progress)
+            sent = self._finish(conn, brain, person, read, recalled, result, spoken, key, progress)
         finally:
             if result.later:
-                threading.Thread(target=self._follow, args=(result.later, person.id, read, key),
+                threading.Thread(target=self._follow, args=(result.later, person.id, read, key, sent),
                                  name=f"{self.name}-later-{first.id}", daemon=True).start()
 
-    def _follow(self, later: Later, person_id: int, read: list[tuple[store.Message, str]], key: str) -> None:
+    def _follow(self, later: Later, person_id: int, read: list[tuple[store.Message, str]], key: str,
+                sent: int | None) -> None:
         """Deliver what a turn's session says after its answer, once the background tasks it
         waits for end, as further replies of the same turn: each is delivered, remembered and
-        acted on like the first, in writing and with no progress message. Work stopped before
-        it ends is told to the person, except when the service stops: then a plan due at once
-        takes the waits up again after the start. The chat is free meanwhile: the next message
+        acted on like the first, in writing and with no progress message, and takes the place of
+        the turn's latest message (``sent`` at first), so the chat keeps one message for the work.
+        Work stopped before it ends is told to the person, except when the service stops: then a
+        plan due at once takes the waits up again after the start. The chat is free meanwhile: the next message
         starts a turn and a session of its own, since only a stuck turn resumes its session."""
         conn = connect(self._cfg.db_path)
         try:
@@ -232,8 +236,8 @@ class Worker(threading.Thread):
                     if person is None:
                         break
                     if result.ok and result.text:
-                        self._finish(conn, Brain(conn, owner=person.id), person, read, prompt.Recall([], []),
-                                     result, False, key)
+                        sent = self._finish(conn, Brain(conn, owner=person.id), person, read, prompt.Recall([], []),
+                                            result, False, key, replacing=sent) or sent
                     elif result.cancelled and self._halt.is_set():
                         self._resume_after_stop(conn, person, read, later.waits(), result.duration)
                     elif not result.ok:
@@ -267,7 +271,7 @@ class Worker(threading.Thread):
         person: Person,
         batch: list[store.Message],
         inbox: Path,
-        progress: Progress | None = None,
+        progress: Progress,
     ) -> list[tuple[store.Message, str]]:
         """The text Claude reads for each message of a turn: files saved in the person's inbox, sound
         transcribed, everything else written out. A message read once keeps its text, so a retried
@@ -279,8 +283,7 @@ class Worker(threading.Thread):
             if msg.kind in _INTERNAL or msg.kind == "choice" or payload.get("read"):
                 read.append((msg, msg.text or ""))
                 continue
-            if progress:
-                progress.step(Step(_taking_in(msg.kind)))
+            progress.step(Step(_taking_in(msg.kind)))
             heard = self._transcribe(conn, brain, msg, person.language) if msg.kind in content.SPOKEN else None
             if msg.kind in content.SOUND_ONLY and heard is None:
                 self._api.notify(msg.chat_id, i18n.t(person.language, "voice_unavailable"))
@@ -293,6 +296,7 @@ class Worker(threading.Thread):
             preview = content.save(self._api, payload.get("thumb"), folder, f"{stem}-preview") \
                 if msg.kind in _PREVIEWED and not strip else None
             days = self._cfg.temp_file_days
+            kept = [str(path) for path in (saved, strip, preview) if path]
             if saved:
                 number = files.register(conn, person.id, msg.kind, saved, payload.get("file_id"), payload.get("size"), days)
                 saved = f"{saved} (file #{number})"
@@ -300,12 +304,11 @@ class Worker(threading.Thread):
                 if image:
                     files.register(conn, person.id, "photo", image, None, None, days)
             text = content.describe(msg.kind, payload, msg.text or "", saved, preview, heard, msg.telegram_id, strip)
-            store.set_read(conn, msg.id, text)
+            store.set_read(conn, msg.id, text, kept)
             if msg.kind == "text" and msg.text:
                 vocabulary.learn_from_text(brain, msg.text)
             read.append((msg, text))
-        if progress:
-            progress.step(Step("working"))
+        progress.step(Step("working"))
         return read
 
     def _converse(
@@ -316,27 +319,26 @@ class Worker(threading.Thread):
         read: list[tuple[store.Message, str]],
         prompt_text: str,
         profile: Profile,
-        progress: Progress | None,
+        progress: Progress,
         fresh: Callable[[], tuple[str, prompt.Recall]],
         session: str = "",
     ) -> Result:
         """Run the turn, from the start or resuming ``session``. Messages the person writes
         meanwhile stop it once they pause and no command is running, join ``read``, and the
-        same session resumes with them."""
+        same session resumes with them, in a plan's or a mind's news turn too."""
         while True:
             done, interrupt, news = threading.Event(), threading.Event(), {}
             watcher = threading.Thread(
                 target=self._watch, args=(conn, read[-1][0], progress, done, interrupt, news),
                 daemon=True,
-            ) if progress else None
-            if watcher:
-                watcher.start()
+            )
+            watcher.start()
             run_profile = Profile(profile.args + ("--resume", session), profile.cwd, profile.env) if session else profile
-            result = self._runner.run(prompt_text, run_profile, on_step=progress.step if progress else None,
-                                      interrupt=interrupt,
-                                      follow_for=self._cfg.claude_background_timeout)
-            done.set()
-            if watcher:
+            try:
+                result = self._runner.run(prompt_text, run_profile, on_step=progress.step, interrupt=interrupt,
+                                          follow_for=self._cfg.claude_background_timeout)
+            finally:
+                done.set()
                 watcher.join()
             if not (result.cancelled and news.get("arrived")):
                 return result
@@ -350,7 +352,9 @@ class Worker(threading.Thread):
             if not session:
                 prompt_text = fresh()[0]
             elif added:
-                prompt_text = prompt.update(person, [(m.telegram_id, text) for m, text in added])
+                prompt_text = prompt.update(conn, person, read[0][0].chat_id,
+                                            [(m.telegram_id, text, (m.payload or {}).get("reply")) for m, text in added],
+                                            own_work=read[0][0].kind in _INTERNAL)
             else:
                 prompt_text = "Carry on with what you were doing."
 
@@ -366,14 +370,18 @@ class Worker(threading.Thread):
         """Watch for messages the person writes during the turn and for questions that wait for
         their yes: move the progress message below them at once, so the answer it becomes comes
         after them, and ask the turn to stop once the person pauses, so that it resumes with
-        their messages as soon as no command is running."""
+        their messages as soon as no command is running. A progress not shown yet, as in a plan's
+        or a mind's news turn, starts below the person's first message."""
         seen, since = 0, time.time()
         while not done.wait(FOLLOWUP_POLL):
             arrived = store.waiting(conn, last.chat_id, last.id)
             shown = len(arrived) + approve.asked(conn, last.chat_id, since)
             if shown > seen:
                 seen = shown
-                progress.renew()
+                if progress.started:
+                    progress.renew()
+                elif arrived:
+                    progress.start()
             if arrived and time.time() - arrived[-1][1] >= FOLLOWUP_PAUSE:
                 news["arrived"] = True
                 interrupt.set()
@@ -402,7 +410,10 @@ class Worker(threading.Thread):
         spoken: bool,
         key: str,
         progress: Progress | None = None,
-    ) -> None:
+        replacing: int | None = None,
+    ) -> int | None:
+        """Deliver a turn's result and act on it; return the Telegram id of the message that
+        holds the reply, if any. With ``replacing``, the reply takes the place of that message."""
         msg, last = read[0][0], read[-1][0]
         reason = unavailable(result)
         if reason:
@@ -413,22 +424,27 @@ class Worker(threading.Thread):
             reply, found = directives.extract(result.text, key)
             for term, heard in directives.corrections(found):
                 vocabulary.learn_correction(brain, term, heard)
-            skipped = directives.skip(found) if msg.kind == planner.PLAN else None
+            # A plan may send nothing, unless the person wrote during its turn and waits for the reply.
+            skipped = directives.skip(found) if msg.kind == planner.PLAN and len(read) == 1 else None
             try:
                 outcome, sent_id = (f"[sent nothing: {skipped}]", None) if skipped else self._reply(
-                    conn, person, last, reply, found, spoken, progress
+                    conn, person, last, reply, found, spoken, _origin(msg), progress, replacing
                 )
             except TelegramError:
                 store.note(conn, msg.id, "answer", {"text": result.text, "key": key})
                 raise
             for done, _ in read:
                 store.mark(conn, done.id, "answered")
+            keep = partial(secrets.keep, self._cfg)
+            store.mask_secrets(conn, [done.id for done, _ in read], keep)
             said = "\n".join(f"{prompt.anchor(m.telegram_id)}{_speaker(m, person)}: {text}" for m, text in read)
             shown = [r.id for r in recalled.memories]
             used = [n for n in directives.used(found) if n in shown]
             brain.reinforce(used, [n for n in shown if n not in used])
             context = [*recalled.origins, *used]
-            episode = brain.learn("episode", f"{said}\n{prompt.anchor(sent_id)}Zoe: {outcome}", related=context)
+            remembered = f"{said}\n{prompt.anchor(sent_id)}Zoe: {outcome}"
+            keep(secrets.found(remembered), f"message {msg.id}")
+            episode = brain.learn("episode", secrets.mask(remembered, person.language), related=context)
             receipt = receipts.Receipt(person.language)
             self._plan(conn, brain, person, msg.chat_id, found, [episode, *context], receipt)
             self._files(conn, brain, person, msg.chat_id, found, [episode, *context], receipt)
@@ -437,7 +453,7 @@ class Worker(threading.Thread):
                 self._admit(conn, person, msg.chat_id, found, receipt)
             receipt.send(self._api, msg.chat_id)
             log.info("answered message %d for person %d in %.1fs", msg.id, person.id, result.duration)
-            return
+            return sent_id
 
         if result.refused:
             # Claude came up with more than this person may use: never retried, and the owner is told.
@@ -471,10 +487,15 @@ class Worker(threading.Thread):
         reply: str,
         found: list[tuple[str, str]],
         spoken: bool,
+        origin: dict | None,
         progress: Progress | None = None,
+        replacing: int | None = None,
     ) -> tuple[str, int | None]:
         """Send the reply, its reaction, its options and the texts to forward; return what the
-        person got, as remembered, and the Telegram id of the first message sent."""
+        person got, as remembered, and the Telegram id of the first message sent. The reaction
+        goes on ``msg``, the turn's latest message, and what is sent notes the turn's ``origin``.
+        With ``replacing``, a written reply takes the place of that earlier message of Zoe's: edited
+        in place while nothing came after it, otherwise deleted and sent anew below."""
         wanted = directives.reaction(found)
         reacted = self._react(msg, wanted)
         drafts = directives.forwards(found)
@@ -503,13 +524,19 @@ class Worker(threading.Thread):
                 # What else is said answers the rewritten message, so the person finds it.
                 quoted = target
         sent_id = None
+        if replacing and not target and reply and not voiced and not options:
+            if store.latest(conn, msg.chat_id, replacing) and self._rewrite(conn, msg, reply, replacing):
+                said.append(f"[rewrote #{replacing}] {reply}")
+                sent_id, reply = replacing, ""
+            elif (store.find_message(conn, msg.chat_id, replacing) or {}).get("mine"):
+                self._api.delete_message(msg.chat_id, replacing)
         if reply:
             said.append(reply)
-            sent_id = self._deliver(conn, msg, person, reply, voiced, options, quoted, progress)
+            sent_id = self._deliver(conn, msg, person, reply, voiced, options, quoted, origin, progress)
         # A text to forward comes bare, as a message of its own the person can forward as it is.
         for draft in drafts:
             said.append(f"[to forward] {draft}")
-            forwarded = self._deliver(conn, msg, person, draft, False, [], None, progress)
+            forwarded = self._deliver(conn, msg, person, draft, False, [], None, origin, progress)
             sent_id = sent_id or forwarded
         if said:
             return "\n".join(said), sent_id
@@ -614,7 +641,8 @@ class Worker(threading.Thread):
             for n, ((record, path), message) in enumerate(zip(chosen, sent)):
                 name = record.name if record else path.name
                 store.record_outbound(conn, chat_id, message.get("message_id"),
-                                      f"[file «{name}»] {caption if n == 0 else ''}".strip(), person.id)
+                                      f"[file «{name}»] {caption if n == 0 else ''}".strip(), person.id,
+                                      {"files": [str(path or record.path)]})
 
     def _admit(
         self, conn: sqlite3.Connection, owner: Person, chat_id: int, found: list[tuple[str, str]],
@@ -691,14 +719,14 @@ class Worker(threading.Thread):
         spoken: bool,
         options: list[str],
         quoted: int | None,
+        origin: dict | None,
         progress: Progress | None = None,
     ) -> int | None:
         """Send the reply: as a voice note when asked for and possible, otherwise as formatted
         text, with one button per option on its last part when it asks to choose, answering
         the quoted message if any. Text that answers no quoted message takes the place of the
-        progress message. Every message sent is logged with its Telegram id; return the id of
-        the first."""
-        origin = _origin(msg)
+        progress message. Every message sent is logged with its Telegram id and ``origin``;
+        return the id of the first."""
         if spoken and not options and self._speaker is not None and len(text) <= self._cfg.tts_max_chars:
             if progress:
                 progress.step(Step("recording"))

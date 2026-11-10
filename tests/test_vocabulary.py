@@ -49,6 +49,17 @@ def test_long_messages_and_pasted_code_cannot_flood_the_graph():
     assert learn_from_text(brain, "\n".join(f"ERROR Pod{i}" for i in range(40))) == []
 
 
+def test_a_pasted_key_never_becomes_a_term_but_job_ids_and_names_do():
+    brain = _brain()
+    key = "sk-or-v1-" + "0123456789abcdef" * 4
+    job = "3f2a9c1e-7b4d-4e8a-9c2f-1a2b3c4d5e6f"
+    learn_from_text(brain, f"la chiave di Zylo: {key} e poi il job {job} di Mia3")
+    terms = {r.content for r in brain.top(TERM)}
+    assert key not in terms and not any("0123456789abcdef" in t for t in terms)
+    assert {job, "Mia3", "Zylo"} <= terms
+    assert "0123456789abcdef" not in glossary(brain, "", "it")
+
+
 def test_glossary_respects_budget():
     brain = _brain()
     for i in range(100):

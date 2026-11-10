@@ -1,5 +1,6 @@
 """Checks for the durable message queue and per-chat ordering."""
 
+import json
 import sqlite3
 import sys
 from pathlib import Path
@@ -35,6 +36,23 @@ def test_record_then_claim():
     msg = store.claim_next(conn)
     assert msg is not None and msg.text == "hi" and msg.attempts == 1 and msg.person_id == pid
     assert store.claim_next(conn) is None
+
+
+def test_keys_in_answered_messages_are_kept_then_masked_and_other_messages_are_untouched():
+    conn, pid = _conn()
+    key, other = "sk-test-" + "Q7w" * 8, "0123456789abcdef" * 2
+    voice = store.record_inbound(conn, _update(1, text="[voice]"), pid)
+    store.record_inbound(conn, _update(2, text=f"tienila tu: {key}"), pid)
+    store.set_read(conn, voice, f"la chiave è {key}")
+    store.note(conn, voice, "reply", {"text": f"vecchia {other}"})
+    kept = []
+    store.mask_secrets(conn, [], lambda keys, where: kept.append((keys, where)))
+    store.mask_secrets(conn, [voice], lambda keys, where: kept.append((keys, where)))
+    assert kept == [([key, other], f"message {voice}")]
+    rows = conn.execute("SELECT text, payload FROM messages ORDER BY id").fetchall()
+    assert rows[0]["text"] == "la chiave è [chiave salvata in credenziali]"
+    assert json.loads(rows[0]["payload"])["reply"] == {"text": "vecchia [chiave salvata in credenziali]"}
+    assert rows[1]["text"] == f"tienila tu: {key}"
 
 
 def test_duplicate_update_is_ignored():

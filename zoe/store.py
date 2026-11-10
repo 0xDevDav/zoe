@@ -14,9 +14,10 @@ import json
 import sqlite3
 import threading
 import time
+from collections.abc import Callable, Iterable
 from dataclasses import dataclass
 
-from . import content
+from . import content, i18n, secrets
 
 
 @dataclass(frozen=True)
@@ -239,12 +240,33 @@ def note(conn: sqlite3.Connection, message_id: int, key: str, value: object) -> 
     )
 
 
-def set_read(conn: sqlite3.Connection, message_id: int, text: str) -> None:
-    """Store the text Claude reads for a message, its files saved and its sound transcribed, once for all."""
+def mask_secrets(conn: sqlite3.Connection, message_ids: list[int], keep: Callable[[list[str], str], None]) -> None:
+    """Hand the keys in these messages to ``keep``, then leave only a placeholder for them, in the
+    sender's language. The text is the one Claude read (``set_read``), a voice note's transcript included."""
+    if not message_ids:
+        return
+    rows = conn.execute(
+        "SELECT m.id, m.text, m.payload, p.language FROM messages m LEFT JOIN persons p ON p.id = m.person_id "
+        f"WHERE m.id IN ({','.join('?' * len(message_ids))})",
+        message_ids,
+    ).fetchall()
+    for row in rows:
+        keys = secrets.found(row["text"], row["payload"])
+        if not keys:
+            continue
+        keep(keys, f"message {row['id']}")
+        language = row["language"] or i18n.DEFAULT
+        text, payload = (secrets.mask(v, language) if v else v for v in (row["text"], row["payload"]))
+        conn.execute("UPDATE messages SET text = ?, payload = ? WHERE id = ?", (text, payload, row["id"]))
+
+
+def set_read(conn: sqlite3.Connection, message_id: int, text: str, saved: Iterable[str] = ()) -> None:
+    """Store the text Claude reads for a message, its files saved and its sound transcribed, once for all,
+    with the paths of the files saved from it, so a later reply to it can show them."""
     conn.execute(
-        "UPDATE messages SET text = ?, payload = json_set(COALESCE(payload, '{}'), '$.read', 1), updated_at = ? "
-        "WHERE id = ?",
-        (text, time.time(), message_id),
+        "UPDATE messages SET text = ?, payload = json_set(COALESCE(payload, '{}'), '$.read', 1, '$.files', json(?)), "
+        "updated_at = ? WHERE id = ?",
+        (text, json.dumps(list(saved)), time.time(), message_id),
     )
 
 
@@ -308,21 +330,32 @@ def find_message(conn: sqlite3.Connection, chat_id: int, telegram_id: int) -> di
     }
 
 
+def latest(conn: sqlite3.Connection, chat_id: int, telegram_id: int) -> bool:
+    """Whether that message is still the last one the chat shows: none logged after it carries a
+    Telegram id, as every message in the chat does."""
+    return conn.execute(
+        "SELECT 1 FROM messages WHERE chat_id = ? AND telegram_id IS NOT NULL AND id > "
+        "(SELECT MAX(id) FROM messages WHERE chat_id = ? AND telegram_id = ?) LIMIT 1",
+        (chat_id, chat_id, telegram_id),
+    ).fetchone() is None
+
+
 def recent_history(conn: sqlite3.Connection, chat_id: int, limit: int = 10, before: int | None = None) -> list[dict]:
     """Return the last completed exchanges of a chat, oldest first, for conversation context; with
     ``before``, those that came before that message.
 
     Plans Zoe ran and news from her parallel minds are left out: they are her own
     business, and only what she sent about them is part of the chat. A message sent
-    as a reply says which message it answered.
+    as a reply carries the description of the message it answered.
     """
     rows = conn.execute(
-        "SELECT direction, text, telegram_id, json_extract(payload, '$.reply.id') AS reply_to FROM messages "
+        "SELECT direction, text, telegram_id, json_extract(payload, '$.reply') AS reply FROM messages "
         "WHERE chat_id = ? AND text IS NOT NULL AND state = 'answered' AND kind NOT IN ('plan', 'mind') "
         "AND (? IS NULL OR id < ?) ORDER BY id DESC LIMIT ?",
         (chat_id, before, before, limit),
     ).fetchall()
     return [
-        {"direction": r["direction"], "text": r["text"], "telegram_id": r["telegram_id"], "reply_to": r["reply_to"]}
+        {"direction": r["direction"], "text": r["text"], "telegram_id": r["telegram_id"],
+         "reply": json.loads(r["reply"]) if r["reply"] else None}
         for r in reversed(rows)
     ]

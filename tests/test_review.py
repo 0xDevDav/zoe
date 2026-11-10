@@ -1,6 +1,9 @@
 """Checks for the nightly review: when it runs, merging memories, what it may change, and the record it leaves."""
 
+import contextlib
+import io
 import json
+import os
 import sys
 import tempfile
 import time
@@ -11,7 +14,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 
 from fakes import OWNER, FakeRunner, worker_setup
-from zoe import access, review, store, vocabulary
+from zoe import access, prompt, review, store, vocabulary
 from zoe.brain import Brain
 
 
@@ -50,6 +53,68 @@ def test_a_merged_memory_keeps_the_links_of_both_and_only_the_persons_own_merge(
         assert brain.kept(espresso) == coffee and brain.kept(coffee) == coffee
         assert conn.execute("SELECT created_at FROM neurons WHERE id = ?", (coffee,)).fetchone()[0] == 100.0
         assert not brain.merge(coffee, hers) and Brain(conn, mia.id).get(hers) is not None
+
+
+def test_changes_the_owner_asks_for_apply_like_a_review_and_a_dry_run_changes_nothing():
+    with tempfile.TemporaryDirectory() as tmp:
+        home = Path(tmp)
+        conn, owner, *_ = worker_setup(home, on_disk=True)
+        brain = Brain(conn, owner.id)
+        tea, green = brain.learn("preference", "Ama il tè"), brain.learn("preference", "Beve tè verde")
+        shifts = brain.learn("fact", "Lavora a turni")
+        episode = brain.learn("episode", "[#41] Alex: bevo solo tè")
+        mia = access.create_person(conn, "Mia", "member", "it")
+        hers = Brain(conn, mia.id).learn("fact", "Abita a Roma")
+        asked = home / "asked.json"
+        asked.write_text(json.dumps({
+            "merge": [{"keep": tea, "drop": [green, episode], "content": "Ama il tè, soprattutto verde"}],
+            "forget": [{"id": shifts, "why": "detto per scherzo"}, {"id": hers, "why": "x"}],
+        }), encoding="utf-8")
+        env = {"ZOE_BOT_TOKEN": "x", "ZOE_OWNER_IDS": str(OWNER), "ZOE_HOME": str(home)}
+        saved = {key: os.environ.get(key) for key in env}
+        os.environ.update(env)
+        try:
+            shown = io.StringIO()
+            with contextlib.redirect_stdout(shown):
+                review.main(["apply", str(asked), "--dry-run"])
+            said = shown.getvalue()
+            assert said.rstrip().endswith("dry run: nothing changed")
+            tried = json.loads(said[:said.rindex("}") + 1])
+            assert tried["merged"][0]["replaced"] == ["Ama il tè", "Beve tè verde"]
+            assert tried["forgot"] == [{"content": "Lavora a turni", "why": "detto per scherzo"}]
+            assert brain.get(tea).content == "Ama il tè" and brain.get(green) and brain.get(shifts)
+            assert brain.kept(green) == green and not (home / "reviews").exists()
+
+            with contextlib.redirect_stdout(io.StringIO()):
+                review.main(["apply", str(asked)])
+            assert brain.get(tea).content == "Ama il tè, soprattutto verde" and brain.get(green) is None
+            assert brain.kept(green) == tea and brain.get(shifts) is None and brain.get(episode)
+            assert Brain(conn, mia.id).get(hers) is not None
+            [record] = (home / "reviews").glob(f"*-{owner.id}.json")
+            logged = json.loads(record.read_text(encoding="utf-8"))
+            assert logged["merged"][0]["replaced"] == ["Ama il tè", "Beve tè verde"]
+            assert logged["forgot"] == [{"content": "Lavora a turni", "why": "detto per scherzo"}]
+
+            asked.write_text(json.dumps({"forget": [{"id": hers, "why": "si è trasferita"}]}), encoding="utf-8")
+            with contextlib.redirect_stdout(io.StringIO()):
+                review.main(["apply", str(asked), "--person", "Mia"])
+            assert Brain(conn, mia.id).get(hers) is None
+        finally:
+            for key, value in saved.items():
+                if value is None:
+                    os.environ.pop(key, None)
+                else:
+                    os.environ[key] = value
+
+
+def test_only_the_owner_is_told_how_to_change_memories_and_never_with_sql():
+    with tempfile.TemporaryDirectory() as tmp:
+        conn, owner, *_ = worker_setup(Path(tmp))
+        mia = access.create_person(conn, "Mia", "member", "it")
+        told, _ = prompt.build(conn, Brain(conn, owner.id), owner, OWNER, "ciao", Path(tmp))
+        assert "python -m zoe.review apply FILE, first with --dry-run" in told and "with SQL" in told
+        told, _ = prompt.build(conn, Brain(conn, mia.id), mia, 999, "ciao", Path(tmp))
+        assert "zoe.review" not in told
 
 
 def test_the_review_sorts_only_what_it_was_shown_and_records_what_it_replaced():

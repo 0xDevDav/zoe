@@ -214,6 +214,16 @@ CREATE TABLE IF NOT EXISTS minds (
 );
 CREATE INDEX IF NOT EXISTS idx_minds_state ON minds(state, id);
 
+-- What the foreign keys do when a neuron is deleted, done also where they are off, as in the
+-- sqlite3 shell: its links, meaning place and plan go, and files and minds stop pointing to it.
+CREATE TRIGGER IF NOT EXISTS neurons_delete_references AFTER DELETE ON neurons BEGIN
+    DELETE FROM connections WHERE source_id = old.id OR target_id = old.id;
+    DELETE FROM neuron_vectors WHERE neuron_id = old.id;
+    DELETE FROM plans WHERE neuron_id = old.id;
+    UPDATE files SET neuron_id = NULL WHERE neuron_id = old.id;
+    UPDATE minds SET neuron_id = NULL WHERE neuron_id = old.id;
+END;
+
 -- Whether the observer learns about a person, and the last message it read.
 -- A person without a row is observed when they are an owner.
 CREATE TABLE IF NOT EXISTS observation (

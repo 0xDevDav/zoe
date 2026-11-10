@@ -61,10 +61,16 @@ _MINDS = (
 )
 
 _WAITING = (
-    "To wait for something that takes minutes or hours (a print, a render, a download), never wait in the "
-    "foreground: start the waiting command in the background and reply right away. Your reply reaches the "
-    "person at once and the chat stays free; when the task ends you are woken in this same session, and what "
-    "you write then reaches them as a new message."
+    "Work that ends within about five minutes, such as a change over several accounts or a short download, is "
+    "done in this turn, and the person gets one message: the result. A command in the foreground holds the turn "
+    "for at most two minutes and is then moved to the background, so for a longer step start it in the "
+    "background and wait for its end in this same turn, with checks in the foreground that each last less "
+    "than two minutes, and reply once it is done. Only what takes longer, such as a print, a render or a long "
+    "download, is left running in the background: reply right away with a single line saying what started and "
+    "about how long it takes, nothing more. The chat stays free; when the task ends you are woken in this same "
+    "session, and what you write then takes the place of your last message about it, edited in place, or "
+    "sent anew below when other messages came after it. Write it whole, as that message should read now, and "
+    "never repeat in a result what an earlier update already told the person."
 )
 
 _SELF = (
@@ -72,6 +78,13 @@ _SELF = (
     "yourself: your self-improvement skill changes your own code or skills through your pipeline, in a parallel "
     "mind when it takes more than a few minutes. Never work around yourself instead, with a separate script or a "
     "written rule standing in for a change to your code."
+)
+
+_MEMORY_CHANGES = (
+    "When {name} asks you to merge, correct or forget what you have learned, write the changes in a JSON file "
+    "shaped like the nightly review's answer, shown by python -m zoe.review apply --help, and run python -m "
+    "zoe.review apply FILE, first with --dry-run. Never change memories in zoe.db with SQL, which loses the "
+    "links a merge moves and the record of what changed."
 )
 
 _FILES = (
@@ -119,8 +132,16 @@ STOPPED_WAITS = (
     "repeat what is already done or sent."
 )
 
+# What a plan's or a mind's news turn is told about messages the person wrote during it.
+_OWED = (
+    "{name} is waiting for your reply: finish the task above, then write one reply that covers both it and "
+    "what they wrote, even if the task alone would send nothing."
+)
+
 _LISTED = 120
 _REPLIED = 1000
+# What the conversation shows of a message replied to that is not in full above.
+_QUOTED = 300
 _PORTRAIT = 12
 # Longest memory and history line in a prompt: enough to read, not enough to flood it.
 _MEMORY = 1500
@@ -255,20 +276,63 @@ class _Replied:
     seed: int | None
 
 
-def _replied(conn: sqlite3.Connection, chat_id: int, person: Person, reply: dict) -> _Replied:
-    """Describe the message replied to, from the chat log when it is there, with the neuron behind it:
-    the plan it carried out or the parallel mind it was news of."""
+@dataclass(frozen=True)
+class _Quoted:
+    """A message being replied to: whose it is, and lines telling what it held."""
+
+    found: dict | None
+    text: str
+    whose: str
+    when: str
+    about: list[str]
+
+
+def _quoted(conn: sqlite3.Connection, chat_id: int, person: Person, reply: dict, limit: int,
+            seen: bool = False) -> _Quoted:
+    """Describe the message replied to, from the chat log when it is there: its text cut to ``limit``,
+    the files it held with their paths and the part quoted; when it is ``seen`` in full in the prompt
+    already, only the part quoted. When nothing of it is known, say so, so the person is asked."""
     found = store.find_message(conn, chat_id, reply["id"]) if reply.get("id") else None
     mine = found["mine"] if found else reply.get("from_bot", False)
     text = (found["text"] if found else "") or reply.get("text", "")
-    whose = "a message of yours" if mine else "their own message"
-    number = f" #{reply['id']}" if reply.get("id") else ""
+    held = (found["payload"] if found else {}).get("files") or []
     when = f", sent {planner.stamp(found['created_at'])}" if found else ""
-    line = f"\n{person.name} is replying to {whose}{number}{when}: «{_cut(text, _REPLIED)}»"
+    about = []
+    if not seen:
+        if text:
+            about.append(f"«{_cut(text, limit)}»")
+        if held:
+            about.append(f"Files it held: {', '.join(held)}")
+        if not about:
+            about.append(f"its content is not available: ask {person.name} which message they mean")
     if reply.get("quote"):
-        line += f"\nThey quote this part of it: «{reply['quote']}»"
-    origin = found["payload"] if found and mine else {}
-    return _Replied(text, line, origin.get("plan") or origin.get("neuron"))
+        about.append(f"They quote this part of it: «{reply['quote']}»")
+    return _Quoted(found, text, "a message of yours" if mine else "their own message", when, about)
+
+
+def _replied(conn: sqlite3.Connection, chat_id: int, person: Person, reply: dict) -> _Replied:
+    """Describe the message replied to with the neuron behind it: the plan it carried out or the
+    parallel mind it was news of."""
+    quoted = _quoted(conn, chat_id, person, reply, _REPLIED)
+    number = f" #{reply['id']}" if reply.get("id") else ""
+    line = f"\n{person.name} is replying to {quoted.whose}{number}{quoted.when}: " + "\n".join(quoted.about)
+    found = quoted.found
+    origin = found["payload"] if found and found["mine"] else {}
+    return _Replied(quoted.text, line, origin.get("plan") or origin.get("neuron"))
+
+
+def _said(conn: sqlite3.Connection, chat_id: int, person: Person, who: str, telegram_id: int | None, text: str,
+          reply: dict | None, seen: Iterable[int] = ()) -> str:
+    """A message as shown in the conversation, with what the message it replies to held, unless that
+    one is ``seen`` in full above it."""
+    if not reply:
+        return f"{anchor(telegram_id)}{who}: {text}"
+    quoted = _quoted(conn, chat_id, person, reply, _QUOTED, reply.get("id") in seen)
+    said = f"{anchor(telegram_id)}{who}, replying to #{reply.get('id')}: {text}"
+    if not quoted.about:
+        return said
+    heading = f"  (#{reply.get('id')} is {quoted.whose}{quoted.when}:"
+    return "\n".join([said, heading, *(f"  {line}" for line in quoted.about)]) + ")"
 
 
 _MIND_NEWS = {
@@ -280,14 +344,17 @@ _MIND_NEWS = {
 }
 
 
-def update(person: Person, news: list[tuple[int | None, str]]) -> str:
-    """What resumes a turn interrupted by messages the person wrote while it worked."""
+def update(conn: sqlite3.Connection, person: Person, chat_id: int,
+           news: list[tuple[int | None, str, dict | None]], own_work: bool = False) -> str:
+    """What resumes a turn interrupted by messages the person wrote while it worked, each with what
+    the message it replies to held. A turn of Zoe's ``own_work``, a plan or a mind's news, owes
+    them a reply even when that work alone would send nothing."""
     lines = [f"While you were working, {person.name} wrote:"]
-    lines += [f"{anchor(telegram_id)}{person.name}: {text}" for telegram_id, text in news]
-    lines.append(
+    lines += [_said(conn, chat_id, person, person.name, telegram_id, text, reply) for telegram_id, text, reply in news]
+    lines.append(_OWED.format(name=person.name) if own_work else (
         "It may correct or add to what they asked. Take it into account, change what you were doing if needed, "
         "and then write one reply that covers everything, following the same rules as before."
-    )
+    ))
     lines.append(_reply_in(person))
     return "\n".join(lines)
 
@@ -304,7 +371,7 @@ def _ending(
     telegram_id: int | None,
     plan: dict | None,
     mind: dict | None,
-    followups: list[tuple[int | None, str]],
+    followups: list[str],
     key: str,
 ) -> str:
     if mind is not None:
@@ -320,8 +387,9 @@ def _ending(
             "never shown."
         )
     else:
-        said = "\n" + "\n".join(f"{anchor(number)}{person.name}: {words}"
-                                for number, words in [(telegram_id, text), *followups])
+        said = "\n" + "\n".join([f"{anchor(telegram_id)}{person.name}: {text}", *followups])
+    if followups and (mind is not None or plan is not None):
+        said += "\n" + "\n".join([f"{person.name} also wrote:", *followups, _OWED.format(name=person.name)])
     return f"{said}\n{_reply_in(person)}\nYou:"
 
 
@@ -350,7 +418,7 @@ def build(
     plan: dict | None = None,
     mind: dict | None = None,
     reply: dict | None = None,
-    followups: list[tuple[int | None, str]] = (),
+    followups: list[tuple[int | None, str, dict | None]] = (),
     key: str = "",
     temp_file_days: float = 7.0,
     archive: Path | None = None,
@@ -359,7 +427,7 @@ def build(
 
     A due plan and news from a parallel mind are given as their queued payloads,
     a reply as the description of the message it answers, and the messages the
-    person sent right after the first as (Telegram id, text). Recall starts from
+    person sent right after the first as (Telegram id, text, the reply's description). Recall starts from
     the neuron of the plan or of the mind's task, from the one behind a message of
     Zoe's being replied to, from every text, and from the latest messages of the chat. ``key`` is the turn's
     directive key: it goes into the fixed instructions only, never into text Zoe reads.
@@ -367,7 +435,7 @@ def build(
     replied = _replied(conn, chat_id, person, reply) if reply else None
     origins = ((plan or {}).get("plan"), (mind or {}).get("neuron"), replied and replied.seed)
     history = store.recent_history(conn, chat_id)
-    written = (text, *(words for _, words in followups), replied and replied.text)
+    written = (text, *(words for _, words, _ in followups), replied and replied.text)
     starts = seeds(origins, [brain.search(words) for words in written if words], brain.search(context(history)))
     memories = select(brain.recall(starts, limit=_REACHED))
 
@@ -389,6 +457,8 @@ def build(
     parts.extend(_people(conn, person, key, archive))
     parts.append(directives.keyed(_FILES, key).replace("{days}", f"{temp_file_days:g}").replace("{chat}", str(chat_id)))
     parts.extend(_portrait(conn, brain, person, {r.id for r in memories}))
+    if person.role == "owner":
+        parts.append(_MEMORY_CHANGES.format(name=person.name))
 
     if memories:
         parts.append("\nWhat you remember that may be relevant, each with its number:")
@@ -400,12 +470,16 @@ def build(
 
     if history:
         parts.append("\nRecent conversation:")
+        seen: set[int] = set()
         for turn in history:
             who = "You" if turn["direction"] == "out" else person.name
-            replying = f", replying to #{turn['reply_to']}" if turn.get("reply_to") else ""
-            parts.append(f"{anchor(turn['telegram_id'])}{who}{replying}: {_cut(turn['text'], _TURN)}")
+            parts.append(_said(conn, chat_id, person, who, turn["telegram_id"], _cut(turn["text"], _TURN),
+                               turn["reply"], seen))
+            if turn["telegram_id"] and len(turn["text"]) <= _TURN:
+                seen.add(turn["telegram_id"])
 
     if replied:
         parts.append(replied.line)
-    parts.append(_ending(person, text, telegram_id, plan, mind, list(followups), key))
+    shown = [_said(conn, chat_id, person, person.name, number, words, quoted) for number, words, quoted in followups]
+    parts.append(_ending(person, text, telegram_id, plan, mind, shown, key))
     return "\n".join(parts), Recall([nid for nid in origins if nid], memories)

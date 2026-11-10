@@ -92,6 +92,7 @@ class FakeAPI:
         self.edits: list[tuple[int, int, str | None, list | None]] = []
         self.edited: dict[int, str] = {}
         self.edits_fail = False
+        self.deletes_fail = False
         self.notices: list[str | None] = []
         self.deleted: list[tuple[int, int]] = []
         self.calls: list[tuple[str, dict]] = []
@@ -160,8 +161,11 @@ class FakeAPI:
     def edit_buttons(self, chat_id: int, message_id: int, buttons: list) -> None:
         self.edits.append((chat_id, message_id, None, buttons))
 
-    def delete_message(self, chat_id: int, message_id: int) -> None:
+    def delete_message(self, chat_id: int, message_id: int) -> bool:
+        if self.deletes_fail:
+            return False
         self.deleted.append((chat_id, message_id))
+        return True
 
     def answer_callback(self, callback_id: str, text: str | None = None) -> None:
         self.notices.append(text)

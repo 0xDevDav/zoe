@@ -1,5 +1,6 @@
 """Checks for received files: temporary unless kept, remembered when kept, deleted carefully, sent back."""
 
+import re
 import shutil
 import struct
 import sys
@@ -38,6 +39,27 @@ def test_a_received_file_is_temporary_and_the_sweep_deletes_it():
         assert files.sweep(conn, time.time()) == 0 and saved.exists()
         assert files.sweep(conn, time.time() + 8 * 86400) == 1
         assert not saved.exists() and files.get(conn, owner.id, 1) is None
+
+
+def test_a_reply_to_a_received_file_shows_where_it_was_saved():
+    with tempfile.TemporaryDirectory() as tmp:
+        conn, owner, worker, runner, _ = worker_setup(Path(tmp), "Visto.", "Ok.", "Eccolo.")
+        _photo(conn, owner.id, 5, "menu", "il menu della cena")
+        worker._handle(conn, store.claim_next(conn))
+        [saved] = list((Path(tmp) / "inbox").rglob("5-menu.pdf"))
+        reply = {"message_id": 5, "from": {"id": OWNER}, "caption": "il menu della cena"}
+        store.record_inbound(conn, {"update_id": 6, "message": {
+            "message_id": 6, "chat": {"id": OWNER, "type": "private"}, "from": {"id": OWNER},
+            "text": "mandalo a Sam", "reply_to_message": reply}}, owner.id)
+        worker._handle(conn, store.claim_next(conn))
+        assert "Alex is replying to their own message #5, sent " in runner.prompts[-1]
+        assert f"\nFiles it held: {saved}" in runner.prompts[-1]
+
+        store.record_inbound(conn, {"update_id": 7, "message": {
+            "message_id": 7, "chat": {"id": OWNER, "type": "private"}, "from": {"id": OWNER}, "text": "fatto?"}},
+            owner.id)
+        worker._handle(conn, store.claim_next(conn))
+        assert re.search(r"\n\[#6\] Alex, replying to #5: mandalo a Sam\n\[#\d+\] You: Ok\.\n", runner.prompts[-1])
 
 
 def test_a_kept_file_is_remembered_where_it_is_and_survives_the_sweep():

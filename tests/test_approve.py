@@ -10,8 +10,8 @@ from pathlib import Path
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 
-from fakes import OWNER, button_data, press, worker_setup
-from zoe import access, approve, store
+from fakes import OWNER, button_data, message, press, worker_setup
+from zoe import access, approve, say, store
 from zoe import worker as worker_module
 from zoe.claude_runner import Result
 from zoe.db import connect
@@ -109,6 +109,89 @@ def test_a_member_cannot_answer_and_without_a_chat_the_answer_is_no():
 
         allowed, why = approve.decide({"tool_name": "Bash", "tool_input": PUSH}, worker._cfg, {})
         assert not allowed and "nobody can be asked now" in why
+
+
+def _with_buttons(api, chat_id: int) -> list[tuple[int, list]]:
+    """The messages of a chat still there with buttons, oldest first, as they read after their edits."""
+    shown = []
+    for (cid, _, buttons), number in zip(api.sent, api.sent_ids):
+        for edited_chat, edited, _, new_buttons in api.edits:
+            if (edited_chat, edited) == (cid, number):
+                buttons = new_buttons
+        if cid == chat_id and buttons and (cid, number) not in api.deleted:
+            shown.append((number, buttons))
+    return shown
+
+
+def _ask(conn) -> int:
+    return conn.execute("INSERT INTO approvals (chat_id, asker, tool, args, created_at) VALUES (?, '', 'Bash', ?, ?)",
+                        (OWNER, json.dumps(PUSH), time.time())).lastrowid
+
+
+def test_a_waiting_question_moves_once_below_what_reaches_the_chat_after_it():
+    with tempfile.TemporaryDirectory() as tmp:
+        conn, owner, worker, _, api = worker_setup(Path(tmp))
+        number = _ask(conn)
+        approve.deliver(conn, api)
+        first = api.sent_ids[-1]
+
+        # A notice in Zoe's name and a message of the owner come after the question.
+        say.queue(conn, Path(tmp), OWNER, "📬 Una mail nuova da Mia", origin="mail")
+        say.queue(conn, Path(tmp), OWNER, "📬 Un'altra mail da Mia", origin="mail")
+        say.deliver(conn, api)
+        api._next_id += 1
+        Poller(worker._cfg, api, threading.Event()).process(conn, message(api._next_id, OWNER, "ci sei?"))
+        approve.deliver(conn, api)
+        assert [n for n, _ in _with_buttons(api, OWNER)] == [first], "it waits for the chat to settle"
+
+        approve.deliver(conn, api, now=time.time() + approve.SETTLE)
+        [(moved, buttons)] = _with_buttons(api, OWNER)
+        assert moved == api.sent_ids[-1] and (OWNER, first) in api.deleted
+        assert button_data(buttons) == [f"a:allow:{number}", f"a:deny:{number}"]
+        assert "Posso farlo?" in api.to(OWNER)[-1] and "<code>git push origin main</code>" in api.to(OWNER)[-1]
+        assert conn.execute("SELECT message_id FROM approvals WHERE id = ?", (number,)).fetchone()[0] == moved
+
+        sent = len(api.sent)
+        approve.deliver(conn, api, now=time.time() + 60)
+        assert len(api.sent) == sent, "nothing new came, so it stays"
+
+        Poller(worker._cfg, api, threading.Event()).process(conn, press(9, OWNER, f"a:allow:{number}", moved))
+        assert conn.execute("SELECT state FROM approvals WHERE id = ?", (number,)).fetchone()[0] == "allowed"
+        assert api.edits[-1][1] == moved and api.edits[-1][2].endswith("✅ Consentito") and not _with_buttons(api, OWNER)
+
+
+def test_a_question_telegram_does_not_delete_loses_its_buttons_when_it_moves():
+    with tempfile.TemporaryDirectory() as tmp:
+        conn, owner, worker, _, api = worker_setup(Path(tmp))
+        _ask(conn)
+        approve.deliver(conn, api)
+        first = api.sent_ids[-1]
+        say.queue(conn, Path(tmp), OWNER, "📬 Una mail nuova da Mia")
+        say.deliver(conn, api)
+        api.deletes_fail = True
+        approve.deliver(conn, api, now=time.time() + approve.SETTLE)
+        assert api.edited[first] == "⬇️ Richiesta spostata in fondo alla chat"
+        assert [n for n, _ in _with_buttons(api, OWNER)] == [api.sent_ids[-1]]
+
+
+def test_a_question_answered_while_it_moves_keeps_no_second_set_of_buttons():
+    with tempfile.TemporaryDirectory() as tmp:
+        conn, owner, worker, _, api = worker_setup(Path(tmp))
+        number = _ask(conn)
+        approve.deliver(conn, api)
+        say.queue(conn, Path(tmp), OWNER, "📬 Una mail nuova da Mia")
+        say.deliver(conn, api)
+        ask_again = api.send_message
+
+        def answered_meanwhile(chat_id, text, **kwargs):
+            sent = ask_again(chat_id, text, **kwargs)
+            approve.answer(conn, api, owner, {"id": "tap", "data": f"a:deny:{number}"})
+            return sent
+
+        api.send_message = answered_meanwhile
+        approve.deliver(conn, api, now=time.time() + approve.SETTLE)
+        assert conn.execute("SELECT state FROM approvals WHERE id = ?", (number,)).fetchone()[0] == "denied"
+        assert not _with_buttons(api, OWNER) and (OWNER, api.sent_ids[-1]) in api.deleted
 
 
 class AsksDuringTheTurn:

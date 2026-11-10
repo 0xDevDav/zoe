@@ -183,7 +183,10 @@ working is usually a correction or an addition, so:
   changed, and writes one reply that covers everything;
 - if the turn fails, the messages it took in go back to the queue.
 
-Plans and news from parallel minds run to the end without taking messages in.
+Plans and news from parallel minds take messages in the same way. They show no
+progress message while nobody writes; the person's first message brings it in
+below, and the one reply covers both Zoe's own task and what the person wrote,
+even when a plan alone would have sent nothing.
 
 ## Directives
 
@@ -226,7 +229,12 @@ conversation and in her memories.
 
 - When the person replies to a message, quoting all of it or a part, Zoe gets
   that message and when it was sent, even when it is long gone from the recent
-  conversation, and recall starts from it.
+  conversation, and recall starts from it. The same holds wherever a reply
+  shows up: in the recent conversation, among the messages that arrive with it
+  and among those written while a turn works. Zoe sees the replied message's text
+  (cut short there, unless it is shown in full just above), the paths of the
+  files it held, received or sent, and the part quoted. When that message is not
+  known, the prompt says so and Zoe asks which one the person means.
 - Zoe answers a specific message, hers or the person's, with `[[KEY quote: 4521]]`,
   to bring something back to mind. Only messages of the same chat can be quoted.
 - Zoe changes one of her own earlier messages with `[[KEY edit: 4521]]` (a list
@@ -248,7 +256,8 @@ of timers.
   and cancels one with `[[KEY unplan: 12]]`. Every turn sees the current time and the
   person's pending plans.
 - A due plan joins its chat's queue and runs as an ordinary turn: in order with
-  the chat's messages, with the person's powers, without a progress message.
+  the chat's messages, with the person's powers, without a progress message
+  unless the person writes during it.
   If Zoe is answering something, the plan waits, then she writes it herself
   right after that conversation, bringing it in naturally.
 - Recall starts from the plan's neuron, so Zoe knows why she made it. What she
@@ -256,7 +265,8 @@ of timers.
   plan remembers its earlier runs, and a later reply to the message leads back
   to the plan.
 - A run with nothing worth sending ends with `[[KEY skip: reason]]`: the person gets
-  nothing, and the reason is remembered for the next run.
+  nothing, and the reason is remembered for the next run. When the person wrote
+  during the run, the reply to them goes out all the same.
 - A plan is not lost. Plans live in the database, so they survive restarts, and
   a plan that came due while Zoe was off runs once when she starts. Telegram
   calls that fail for a passing reason are retried, and so is a failed turn. If
@@ -343,6 +353,13 @@ cannot message anyone: its answer is data.
   `ZOE_HOME/reviews` with what every change replaced, and its one-line summary
   shows in the owner's menu, under Improvements. Weak links are then pruned.
   `python -m zoe.review` runs one now.
+- **Changes the owner asks for** (merge these, correct that, forget this) are
+  written the way the review answers and applied the same way with
+  `python -m zoe.review apply FILE`: `--dry-run` shows what would change and
+  changes nothing, `--person` names someone other than the owner, and each
+  change is recorded in `ZOE_HOME/reviews` with what it replaced. Memory is
+  never edited with SQL, which loses the links a merge moves and the record of
+  what changed.
 - Every turn sees how the person has been lately and the most salient things
   learned about them.
 - Owners are observed unless they turn it off; anyone else only once they or an
@@ -451,7 +468,11 @@ only in instructions:
   parallel minds run with them as `permissions.ask`, so Claude Code's own rule
   matching decides, and with `approve.py` as their PermissionRequest hook: the
   question reaches the chat with what is about to happen and Allow and Deny
-  buttons, and the action waits up to 10 minutes for a tap. No answer, a
+  buttons, and the action waits up to 10 minutes for a tap. While it waits the
+  question stays the last message of the chat: once messages logged after it
+  (a reply, a notice, the owner's own) are 3 seconds quiet, it is asked again
+  at the bottom with the same buttons and the old one is deleted, or left
+  without buttons when Telegram keeps it. No answer, a
   member's tap, or a run with nobody to ask, such as the nightly study, means
   no, and Claude is told not to try another way. The rules match the command
   as written, so they guard against mistakes, not against a determined program.
@@ -476,7 +497,12 @@ only in instructions:
   tasks still run (a print, a render, a download) sends that answer at once and
   frees the chat; its session is followed on, silent for as long as the tasks
   run, up to `ZOE_CLAUDE_BACKGROUND_TIMEOUT` (four hours), and what Claude says
-  when they end reaches the person as a further reply. A requested restart
+  when they end takes the place of the turn's latest message: edited in place
+  while nothing came after it, otherwise deleted and sent anew below, so the
+  chat keeps one message for the work (a voice note or a reply with options
+  comes as a new message). Work that ends within about five minutes is not left
+  in the background at all: the turn waits for it, with foreground checks under
+  two minutes each, and replies once with the result. A requested restart
   waits for such a session only while it replies or runs a command: one that
   only waits for its tasks is ended by the stop, and a plan due at once, with
   what it waited for and the commands behind it, takes the waits up again after
@@ -504,6 +530,10 @@ only in instructions:
   bot's messages. If something else reads the bot's updates with the same
   token, Telegram reports a conflict and the owner is told, at most once an
   hour.
+- **Nothing points to a deleted neuron.** A neuron deleted on any connection,
+  even in the sqlite3 shell where foreign keys are off, takes its links,
+  meaning place and plan with it, and files and minds stop pointing to it, so
+  a merge or a recall never meets a link to nothing.
 - **One turn per chat.** Messages are claimed from the database one chat at a
   time, a turn takes in only its own chat's messages, and a turn that fails
   gives them back. Parallel minds and the observer never take chat messages:
@@ -658,6 +688,14 @@ zoe-vault get elevenlabs api_key
 zoe-vault delete elevenlabs api_key
 ```
 
+Once a message is answered, every key or token in it, and in its episode, is
+stored in the vault (service `chat`, named by the key's digest), and what Zoe
+keeps of the conversation holds only a placeholder in the person's language
+("key saved in credentials") in its place: the message log, the episode, what
+the observer learns, and never a `term` neuron, so it stays out of the speech
+glossary too (`secrets.py`). Plain UUIDs and commit hashes are left alone,
+since job ids and commits get quoted on purpose.
+
 ## Privacy
 
 Personal data never lives in the source tree, and the repository refuses to
@@ -735,7 +773,7 @@ for t in tests/test_*.py; do python "$t"; done
 | `planner.py` | plans: when they are due, cron rules, queueing them as turns |
 | `minds.py` | parallel minds: long work beside the chat, resumed after restarts, news back to the chat |
 | `observer.py` | reads finished conversations and stores what they show about each person |
-| `review.py` | the nightly review: what was learned, completed, merged, corrected and pruned |
+| `review.py` | the nightly review: what was learned, completed, merged, corrected and pruned; changes the owner asks for |
 | `improve.py` | the nightly study: proposals to improve Zoe, decided in the menu and made by a parallel mind |
 | `approve.py` | the owner's yes on Telegram before an action their rules mark as asking |
 | `availability.py` | whether Claude can work at all: turns and minds wait for a usage limit to reset, owners hear it once |
@@ -758,6 +796,7 @@ for t in tests/test_*.py; do python "$t"; done
 | `speech.py` | Whisper client and ElevenLabs voice |
 | `whisper_server.py` | standalone speech recognition server |
 | `vault.py` | encrypted credential store and its command line |
+| `secrets.py` | recognize pasted keys and keep only a placeholder for them in memory |
 | `i18n.py` | localized service messages |
 | `bot_setup.py` | bot name, descriptions, command menus, Menu button and photo, applied when they differ |
 | `directives.py` | directives in replies, acted on only with the turn's key |

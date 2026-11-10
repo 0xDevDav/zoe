@@ -23,7 +23,7 @@ def test_a_program_speaks_in_zoes_name_and_she_knows_it():
         assert api.sent == [] and say.deliver(conn, api) == 1
         assert api.to(OWNER) == ["📨 <b>PEC</b> da Agenzia Entrate"]
         assert store.recent_history(conn, OWNER)[-1] == {
-            "direction": "out", "text": "[pec] 📨 <b>PEC</b> da Agenzia Entrate", "telegram_id": 101, "reply_to": None}
+            "direction": "out", "text": "[pec] 📨 <b>PEC</b> da Agenzia Entrate", "telegram_id": 101, "reply": None}
         assert say.deliver(conn, api) == 0
 
 

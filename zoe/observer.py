@@ -26,7 +26,7 @@ import sqlite3
 import threading
 import time
 
-from . import access, i18n, review, signals, vocabulary
+from . import access, i18n, review, secrets, signals, vocabulary
 from .access import Person
 from .brain import Brain, Recalled
 from .claude_runner import ClaudeRunner, Profile
@@ -192,7 +192,7 @@ def apply(
 
     learned: list[int] = []
     for item in found_memories:
-        kind, content = item.get("kind"), str(item.get("content") or "").strip()[:_CONTENT]
+        kind, content = item.get("kind"), secrets.mask(str(item.get("content") or "").strip(), person.language)[:_CONTENT]
         if kind not in KINDS or not content:
             continue
         replaced = next(iter(numbers(item.get("replaces"))), None)

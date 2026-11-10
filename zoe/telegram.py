@@ -200,11 +200,14 @@ class TelegramAPI:
         except TelegramError as exc:
             log.warning("buttons of message %s not edited: %s", message_id, exc)
 
-    def delete_message(self, chat_id: int, message_id: int) -> None:
+    def delete_message(self, chat_id: int, message_id: int) -> bool:
+        """Delete a message; return whether it is gone."""
         try:
             self.call("deleteMessage", chat_id=chat_id, message_id=message_id)
         except TelegramError as exc:
             log.warning("message %s not deleted: %s", message_id, exc)
+            return False
+        return True
 
     def answer_callback(self, callback_id: str, text: str | None = None) -> None:
         """Acknowledge a button press, optionally with a short notice shown to the person."""

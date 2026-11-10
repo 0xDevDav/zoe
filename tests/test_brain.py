@@ -1,15 +1,17 @@
-"""Checks for the neuron graph: recall by spreading activation and Hebbian wiring."""
+"""Checks for the neuron graph: recall by spreading activation, Hebbian wiring, and nothing left
+pointing to a deleted neuron."""
 
 import sqlite3
 import sys
+import tempfile
 from array import array
 from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
-from zoe.access import create_person
+from zoe.access import Person, create_person
 from zoe.brain import Brain
-from zoe.db import apply_schema
+from zoe.db import apply_schema, connect
 
 
 def _brain() -> Brain:
@@ -189,6 +191,61 @@ def test_person_writes_into_own_memory():
     own = mind.ensure("term", "Gianduia")
     assert Brain(conn).find("term", "Gianduia") is None
     assert mind.find("term", "Gianduia") == own
+
+
+def _on_disk(folder: Path) -> tuple[sqlite3.Connection, Person]:
+    conn = connect(folder / "zoe.db")
+    apply_schema(conn)
+    return conn, create_person(conn, "Alex", "owner", "it")
+
+
+def _delete_by_hand(db: Path, neuron: int) -> None:
+    """Delete a neuron as a bare sqlite3 connection does, with foreign keys off."""
+    bare = sqlite3.connect(db)
+    bare.execute("DELETE FROM neurons WHERE id = ?", (neuron,))
+    bare.commit()
+    bare.close()
+
+
+def test_a_neuron_deleted_with_foreign_keys_off_leaves_nothing_pointing_to_it():
+    with tempfile.TemporaryDirectory() as tmp:
+        conn, alex = _on_disk(Path(tmp))
+        tables = [r[0] for r in conn.execute("SELECT name FROM sqlite_master WHERE type = 'table'")]
+        pointing = {(table, key["from"], key["on_delete"]) for table in tables
+                    for key in conn.execute(f"PRAGMA foreign_key_list({table})") if key["table"] == "neurons"}
+        assert pointing == {("connections", "source_id", "CASCADE"), ("connections", "target_id", "CASCADE"),
+                            ("neuron_vectors", "neuron_id", "CASCADE"), ("plans", "neuron_id", "CASCADE"),
+                            ("files", "neuron_id", "SET NULL"), ("minds", "neuron_id", "SET NULL")}
+        brain = Brain(conn, alex.id)
+        call, cup = brain.learn("plan", "Chiama Mia"), brain.ensure("term", "Tazza")
+        brain.connect(call, cup)
+        conn.execute("INSERT INTO neuron_vectors (neuron_id, model, vector) VALUES (?, 'm', x'00')", (call,))
+        conn.execute("INSERT INTO plans (neuron_id, chat_id, due_at) VALUES (?, 1, 0)", (call,))
+        conn.execute("INSERT INTO files (neuron_id, person_id, kind, path, name, created_at) "
+                     "VALUES (?, ?, 'document', '/notes/mia.pdf', 'mia.pdf', 0)", (call, alex.id))
+        conn.execute("INSERT INTO minds (neuron_id, person_id, chat_id, title, brief, workdir, created_at) "
+                     "VALUES (?, ?, 1, 'Chiamata', 'Prepara la chiamata', '/work', 0)", (call, alex.id))
+        _delete_by_hand(Path(tmp) / "zoe.db", call)
+        assert conn.execute("PRAGMA foreign_key_check").fetchall() == []
+        assert [tuple(r) for r in conn.execute("SELECT source_id, target_id FROM connections")] == []
+        assert conn.execute("SELECT COUNT(*) FROM neuron_vectors").fetchone()[0] == 0
+        assert conn.execute("SELECT COUNT(*) FROM plans").fetchone()[0] == 0
+        assert conn.execute("SELECT neuron_id FROM files").fetchone()[0] is None
+        assert conn.execute("SELECT neuron_id FROM minds").fetchone()[0] is None
+
+
+def test_a_merge_works_after_a_neuron_it_was_linked_to_was_deleted_by_hand():
+    with tempfile.TemporaryDirectory() as tmp:
+        conn, alex = _on_disk(Path(tmp))
+        brain = Brain(conn, alex.id)
+        tea, green = brain.learn("preference", "Ama il tè"), brain.learn("preference", "Beve tè verde")
+        cup, market = brain.ensure("term", "Tazza"), brain.learn("fact", "Compra il tè al mercato")
+        brain.connect(green, cup)
+        brain.connect(green, market)
+        _delete_by_hand(Path(tmp) / "zoe.db", market)
+        assert brain.merge(tea, green) and brain.kept(green) == tea
+        assert cup in {r.id for r in brain.recall([tea])}
+        assert conn.execute("PRAGMA foreign_key_check").fetchall() == []
 
 
 def _run() -> None:

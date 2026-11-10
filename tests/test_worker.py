@@ -7,6 +7,7 @@ import sys
 import tempfile
 import threading
 import time
+from contextlib import closing
 from datetime import datetime, timedelta
 from pathlib import Path
 from zoneinfo import ZoneInfo
@@ -16,10 +17,10 @@ sys.path.insert(0, str(Path(__file__).resolve().parent))
 
 from fakes import FAKE_FAILURE, OTHER_OWNER_ACCOUNTS, OWNER, button_data, logged, message, press, worker_setup
 from test_runner import _claude
-from zoe import access, app, availability, claude_runner, formatting, i18n, planner, prompt, say, store
+from zoe import access, app, availability, claude_runner, formatting, i18n, minds, planner, prompt, say, store, vault
 from zoe import worker as worker_module
 from zoe.brain import Brain, Recalled
-from zoe.claude_runner import ClaudeRunner, Result
+from zoe.claude_runner import ClaudeRunner, Result, Step
 from zoe.config import Config
 from zoe.ingest import Poller
 from zoe.telegram import TelegramError
@@ -52,6 +53,22 @@ def test_every_message_is_kept_with_its_number_and_shown_with_it():
         assert "[#8] Alex: Chiaro?" in runner.prompts[-1]
         episodes = [r.content for r in Brain(conn, owner.id).top("episode")]
         assert any(e.startswith("[#7] Alex: Raccontami tutto") and f"[#{sent_ids[0]}] Zoe:" in e for e in episodes)
+
+
+def test_a_pasted_key_is_remembered_only_as_saved():
+    key = "sk-or-v1-" + "0123456789abcdef" * 4
+    with tempfile.TemporaryDirectory() as tmp:
+        conn, owner, worker, runner, _ = worker_setup(Path(tmp), "Salvata in credenziali.")
+        _say(conn, worker, owner, 7, f"zylo: {key}")
+        assert key in runner.prompts[-1]
+        brain = Brain(conn, owner.id)
+        episode = brain.top("episode")[0].content
+        assert "zylo: [chiave salvata in credenziali]" in episode and key not in episode
+        assert key not in {r.content for r in brain.top("term", limit=500)}
+        assert store.find_message(conn, OWNER, 7)["text"] == "zylo: [chiave salvata in credenziali]"
+        with closing(vault.open_vault(worker._cfg)) as kept:
+            [entry] = kept.entries("chat")
+            assert kept.get("chat", entry.name) == key and entry.note == "pasted in message 1"
 
 
 def test_the_memories_a_reply_used_are_wired_closer_and_the_rest_drift_away():
@@ -316,6 +333,30 @@ def test_a_reply_to_a_message_brings_its_text_and_time():
         assert "[#6] Alex, replying to #5: spostalo alle 11" in runner.prompts[-1]
 
 
+def test_a_reply_in_the_history_shows_the_message_it_answers_unless_it_is_shown_in_full_above():
+    with tempfile.TemporaryDirectory() as tmp:
+        conn, owner, worker, runner, _ = worker_setup(Path(tmp), *["Ok."] * 20)
+        _say(conn, worker, owner, 5, "La torta di compleanno per Mia: " + "panna " * 80)
+        for update_id in range(6, 18):
+            _say(conn, worker, owner, update_id, f"messaggio {update_id}")
+        _say(conn, worker, owner, 18, "mandala a Sam", reply_to=5, quote="per Mia")
+        _say(conn, worker, owner, 19, "e questo?", reply_to=17)
+        update = message(20, OWNER, "quale?")
+        update["message"]["reply_to_message"] = {"message_id": 900, "from": {"id": OWNER}}
+        store.record_inbound(conn, update, owner.id)
+        worker._handle(conn, store.claim_next(conn))
+        _say(conn, worker, owner, 21, "allora?")
+
+        shown = runner.prompts[-1]
+        assert "[#5]" not in shown.split("Recent conversation:")[1].split("\n[#18]")[0]
+        assert "[#18] Alex, replying to #5: mandala a Sam\n  (#5 is their own message, sent " in shown
+        assert re.search(r"\n  «La torta di compleanno per Mia: (panna )+pan+…»\n", shown)
+        assert "  They quote this part of it: «per Mia»)" in shown
+        assert "[#19] Alex, replying to #17: e questo?\n[#115] You: Ok." in shown
+        assert ("[#20] Alex, replying to #900: quale?\n  (#900 is their own message:\n"
+                "  its content is not available: ask Alex which message they mean)") in shown
+
+
 def test_messages_waiting_together_are_answered_in_one_turn():
     with tempfile.TemporaryDirectory() as tmp:
         conn, owner, worker, runner, api = worker_setup(Path(tmp), "Ok, tutto chiaro.")
@@ -361,6 +402,106 @@ def test_a_message_written_during_the_turn_moves_the_progress_and_joins_the_turn
         assert any("[#7] Alex: Prenota per sabato\n[#8] Alex: anzi, per domenica" in e for e in episodes)
 
 
+class WritesDuringOwnWork:
+    """Zoe works on a plan or on news from a parallel mind and the person writes: the run stops, and its
+    session goes on with the message, or starts over when it had none yet. What the chat showed before
+    the person wrote is kept in ``shown``."""
+
+    def __init__(self, conn, person_id: int, api, wrote: str, reply: str, session: str = "s-7") -> None:
+        self.conn, self.person_id, self.api = conn, person_id, api
+        self.wrote, self.reply, self.session = wrote, reply, session
+        self.prompts, self.profiles, self.shown = [], [], None
+
+    def run(self, prompt_text, profile, on_step=None, cancel=None, interrupt=None, follow_for=0.0) -> Result:
+        self.prompts.append(prompt_text)
+        self.profiles.append(profile)
+        if len(self.prompts) == 1:
+            self.key = re.search(r"Your key for this turn is (\w+)\.", prompt_text).group(1)
+            if on_step:
+                on_step(Step("tool", "Bash", {"description": "Leggo il resoconto"}))
+            self.shown = (list(self.api.sent), list(self.api.actions))
+            store.record_inbound(self.conn, message(8, OWNER, self.wrote), self.person_id)
+            interrupt.wait(5)
+            return Result(False, "", False, False, None, 1.0, session_id=self.session, cancelled=True)
+        return Result(True, self.reply.replace("{k}", self.key), False, False, 0, 1.0, session_id=self.session)
+
+
+def _news_of_a_mind(conn, owner) -> None:
+    store.enqueue(conn, OWNER, owner.id, "Sito pubblicato.", minds.EVENT,
+                  {"mind": 3, "neuron": None, "event": "done", "title": "Sito"})
+
+
+def _due_plan(conn, owner) -> None:
+    planner.create(conn, Brain(conn, owner.id), owner, OWNER, "2026-10-13 15:00", "Controlla il meteo", [])
+    planner.fire_due(conn, datetime(2026, 10, 13, 15, 0).timestamp())
+
+
+def _states(conn) -> list[str]:
+    return [r["state"] for r in conn.execute("SELECT state FROM messages WHERE direction = 'in' ORDER BY id")]
+
+
+def test_a_message_written_during_a_minds_news_brings_the_progress_and_joins_the_turn():
+    with tempfile.TemporaryDirectory() as tmp:
+        conn, owner, worker, _, api = worker_setup(Path(tmp))
+        worker_module.FOLLOWUP_POLL, worker_module.FOLLOWUP_PAUSE = 0.05, 0.1
+        worker._runner = runner = WritesDuringOwnWork(conn, owner.id, api, "a che punto sei?",
+                                                      "Il sito è online, e sì: ho appena finito ✅")
+        _news_of_a_mind(conn, owner)
+        worker._handle(conn, store.claim_next(conn))
+
+        assert runner.shown == ([], []), "nothing shows while nobody writes"
+        assert "Al lavoro" in api.sent[0][1] and "Leggo il resoconto" in api.sent[0][1]
+        assert len(runner.prompts) == 2 and runner.profiles[1].args[-2:] == ("--resume", "s-7")
+        assert ("While you were working, Alex wrote:\n[#8] Alex: a che punto sei?\n"
+                "Alex is waiting for your reply") in runner.prompts[1]
+        assert api.to(OWNER) == ["Il sito è online, e sì: ho appena finito ✅"] and api.deleted == []
+        assert store.find_message(conn, OWNER, api.sent_ids[0])["payload"] == {"mind": 3, "neuron": None}
+        assert _states(conn) == ["answered", "answered"] and store.claim_next(conn) is None
+        episodes = [r.content for r in Brain(conn, owner.id).top("episode")]
+        assert any("Parallel mind #3: Sito pubblicato.\n[#8] Alex: a che punto sei?" in e for e in episodes)
+
+
+def test_a_plan_or_a_minds_news_shows_no_progress_while_nobody_writes():
+    with tempfile.TemporaryDirectory() as tmp:
+        conn, owner, worker, runner, api = worker_setup(Path(tmp), "Il sito è online ✅", "[[{k} skip: niente di nuovo]]")
+        _news_of_a_mind(conn, owner)
+        worker._handle(conn, store.claim_next(conn))
+        _due_plan(conn, owner)
+        worker._handle(conn, store.claim_next(conn))
+        assert len(runner.prompts) == 2 and _states(conn) == ["answered", "answered"]
+        assert api.to(OWNER) == ["Il sito è online ✅"]
+        assert api.actions == [] and api.edits == [] and api.deleted == []
+
+
+def test_a_plan_with_nothing_to_send_still_answers_what_the_person_wrote_during_it():
+    with tempfile.TemporaryDirectory() as tmp:
+        conn, owner, worker, _, api = worker_setup(Path(tmp))
+        worker_module.FOLLOWUP_POLL, worker_module.FOLLOWUP_PAUSE = 0.05, 0.1
+        worker._runner = runner = WritesDuringOwnWork(conn, owner.id, api, "domani piove?",
+                                                      "Sì, domani piove 🌧️\n[[{k} skip: il meteo non è cambiato]]")
+        _due_plan(conn, owner)
+        worker._handle(conn, store.claim_next(conn))
+
+        assert "even if the task alone would send nothing" in runner.prompts[1]
+        assert api.to(OWNER) == ["Sì, domani piove 🌧️"]
+        assert _states(conn) == ["answered", "answered"] and store.claim_next(conn) is None
+
+
+def test_a_minds_news_stopped_before_its_session_began_starts_over_with_what_the_person_wrote():
+    with tempfile.TemporaryDirectory() as tmp:
+        conn, owner, worker, _, api = worker_setup(Path(tmp))
+        worker_module.FOLLOWUP_POLL, worker_module.FOLLOWUP_PAUSE = 0.05, 0.1
+        worker._runner = runner = WritesDuringOwnWork(conn, owner.id, api, "a che punto sei?", "Sito online ✅",
+                                                      session="")
+        _news_of_a_mind(conn, owner)
+        worker._handle(conn, store.claim_next(conn))
+
+        assert "--resume" not in runner.profiles[1].args
+        assert "Your parallel mind #3 «Sito» has finished" in runner.prompts[1]
+        assert "Alex also wrote:\n[#8] Alex: a che punto sei?\nAlex is waiting for your reply" in runner.prompts[1]
+        assert api.to(OWNER) == ["Sito online ✅"] and _states(conn) == ["answered", "answered"]
+
+
 def test_a_failed_turn_returns_the_messages_it_took_in_to_the_queue():
     with tempfile.TemporaryDirectory() as tmp:
         conn, owner, worker, *_ = worker_setup(Path(tmp), None)
@@ -369,6 +510,46 @@ def test_a_failed_turn_returns_the_messages_it_took_in_to_the_queue():
         worker._handle(conn, store.claim_next(conn))
         again = store.claim_next(conn)
         assert again.telegram_id == 5 and [m.telegram_id for m in store.absorb(conn, OWNER, again.id)] == [6]
+
+
+class QuotesDuringTheTurn:
+    """Zoe sends a video; in the next turn the person replies to it while the run works."""
+
+    def __init__(self, conn, person_id: int, video: Path) -> None:
+        self.conn, self.person_id, self.video = conn, person_id, video
+        self.prompts, self.sent = [], None
+
+    def run(self, prompt_text, profile, on_step=None, cancel=None, interrupt=None, follow_for=0.0) -> Result:
+        self.prompts.append(prompt_text)
+        if len(self.prompts) == 1:
+            key = re.search(r"Your key for this turn is (\w+)\.", prompt_text).group(1)
+            return Result(True, f"Eccolo 👇\n[[{key} send: {self.video} | la torta]]", False, False, 0, 1.0)
+        if len(self.prompts) == 2:
+            self.sent = self.conn.execute("SELECT telegram_id FROM messages WHERE text LIKE '[file%'").fetchone()[0]
+            update = message(12, OWNER, "manda questo a Sam")
+            update["message"]["reply_to_message"] = {"message_id": self.sent, "from": {"id": 1, "is_bot": True}}
+            store.record_inbound(self.conn, update, self.person_id)
+            interrupt.wait(5)
+            return Result(False, "", False, False, None, 1.0, session_id="s-2", cancelled=True)
+        return Result(True, "Fatto.", False, False, 0, 1.0, session_id="s-2")
+
+
+def test_a_reply_written_during_the_turn_shows_the_message_it_answers_and_its_files():
+    with tempfile.TemporaryDirectory() as tmp:
+        conn, owner, worker, _, _ = worker_setup(Path(tmp))
+        worker_module.FOLLOWUP_POLL, worker_module.FOLLOWUP_PAUSE = 0.05, 0.1
+        video = Path(tmp) / "torta.mp4"
+        video.write_bytes(b"mp4")
+        worker._runner = runner = QuotesDuringTheTurn(conn, owner.id, video)
+        store.record_inbound(conn, message(10, OWNER, "fammi vedere la torta"), owner.id)
+        worker._handle(conn, store.claim_next(conn))
+        store.record_inbound(conn, message(11, OWNER, "e per Sam?"), owner.id)
+        worker._handle(conn, store.claim_next(conn))
+
+        assert len(runner.prompts) == 3
+        assert (f"While you were working, Alex wrote:\n[#12] Alex, replying to #{runner.sent}: manda questo a Sam\n"
+                f"  (#{runner.sent} is a message of yours, sent ") in runner.prompts[2]
+        assert f"  «[file «torta.mp4»] la torta»\n  Files it held: {video})" in runner.prompts[2]
 
 
 class StuckThenDone:
@@ -504,6 +685,7 @@ def test_a_turn_answers_at_once_while_its_wait_runs_and_tells_when_it_ends():
         while api.to(OWNER)[-1] != "Il pane è pronto 🍞" and time.monotonic() < deadline:
             time.sleep(0.05)
         assert api.to(OWNER)[-1] == "Il pane è pronto 🍞"
+        assert api.deleted == [(OWNER, api.sent_ids[0])], "the buried notice leaves its place to the result below"
         assert [r["state"] for r in conn.execute("SELECT state FROM messages WHERE direction = 'in'")] == \
             ["answered", "answered"]
         assert api.reactions[-1][2] == "👍"
@@ -512,6 +694,45 @@ def test_a_turn_answers_at_once_while_its_wait_runs_and_tells_when_it_ends():
         assert not any("answer" in (r["payload"] or "")
                        for r in conn.execute("SELECT payload FROM messages WHERE direction = 'in'"))
         _done(conn)
+
+
+def test_a_turn_is_told_to_finish_short_work_and_to_announce_long_work_in_one_line():
+    with tempfile.TemporaryDirectory() as tmp:
+        conn, owner, worker, runner, _ = worker_setup(Path(tmp), "Fatto")
+        _say(conn, worker, owner, 5, "blocca Mia ovunque")
+        told = " ".join(runner.prompts[-1].split())
+        assert "Work that ends within about five minutes" in told and "the person gets one message: the result" in told
+        assert "each last less than two minutes" in told
+        assert "reply right away with a single line" in told
+        assert "takes the place of your last message about it" in told
+        assert "never repeat in a result what an earlier update already told the person" in told
+
+
+def test_what_a_wait_ends_with_takes_the_place_of_its_notice():
+    with tempfile.TemporaryDirectory() as tmp:
+        conn, owner, worker, _, api = worker_setup(Path(tmp), on_disk=True)
+        ended = threading.Event()
+
+        class Later:
+            def answers(self, cancel=None):
+                ended.wait(5)
+                yield Result(True, "Render pronto: <b>video.mp4</b>", False, False, 0, 9.0)
+                yield Result(True, "Render pronto: <b>video.mp4</b>, anteprima inclusa", False, False, 0, 3.0)
+
+        class StartsARender:
+            def run(self, prompt_text, profile, on_step=None, cancel=None, interrupt=None, follow_for=0.0):
+                return Result(True, "Avvio il render, circa 20 min", False, False, None, 1.0, session_id="s-6",
+                              later=Later())
+
+        worker._runner = StartsARender()
+        store.record_inbound(conn, message(5, OWNER, "fai il render"), owner.id)
+        worker._handle(conn, store.claim_next(conn))
+        notice = api.sent_ids[-1]
+        ended.set()
+        _done(conn)
+        assert api.to(OWNER) == ["Render pronto: <b>video.mp4</b>, anteprima inclusa"]
+        assert [e[1] for e in api.edits if (e[2] or "").startswith("Render pronto")] == [notice, notice]
+        assert not api.deleted
 
 
 def test_background_work_stopped_before_it_ends_is_told_to_the_person():

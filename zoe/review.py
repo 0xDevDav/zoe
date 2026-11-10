@@ -16,11 +16,14 @@ written to ``ZOE_HOME/reviews`` with what every change replaced, and its summary
 shows in the owner's menu, under Improvements. Then weak links are
 pruned and activation fades across the graph.
 
-The observer's thread runs it; ``python -m zoe.review`` runs one now.
+The observer's thread runs it; ``python -m zoe.review`` runs one now. Changes the
+owner asks for, written the way a review answers, apply the same way with
+``python -m zoe.review apply FILE``, which ``--dry-run`` only shows.
 """
 
 from __future__ import annotations
 
+import argparse
 import json
 import logging
 import sqlite3
@@ -172,8 +175,32 @@ def apply(conn: sqlite3.Connection, person: Person, known: list[Recalled], answe
     return done
 
 
+def change(conn: sqlite3.Connection, person: Person, answer: dict, folder: Path, now: float,
+           dry_run: bool = False) -> tuple[dict, Path | None]:
+    """Apply changes asked for, written like a review's answer, to all of the person's memories and
+    record in ``folder`` what each replaced; return what changed and the record. A dry run tells what
+    would change and changes nothing."""
+    known = memories(conn, person.id)
+    if dry_run:
+        conn.execute("SAVEPOINT dry_run")
+        try:
+            return apply(conn, person, known, answer), None
+        finally:
+            conn.execute("ROLLBACK TO dry_run")
+            conn.execute("RELEASE dry_run")
+    done = apply(conn, person, known, answer)
+    return done, _record(folder, f"{datetime.fromtimestamp(now):%Y-%m-%d-%H%M%S}-{person.id}", done)
+
+
 def _folder(cfg: Config) -> Path:
     return cfg.data_dir / "reviews"
+
+
+def _record(folder: Path, name: str, done: dict) -> Path:
+    folder.mkdir(parents=True, exist_ok=True)
+    path = folder / f"{name}.json"
+    path.write_text(json.dumps(done, ensure_ascii=False, indent=1), encoding="utf-8")
+    return path
 
 
 def last_summary(cfg: Config) -> str:
@@ -220,21 +247,44 @@ class Reviewer:
             log.warning("review run for person %d failed (rc=%s)", person.id, result.returncode)
             return None
         done = apply(conn, person, known, observer.json_object(result.text))
-        day = datetime.fromtimestamp(now).strftime("%Y-%m-%d")
-        (self.folder / f"{day}-{person.id}.json").write_text(
-            json.dumps(done, ensure_ascii=False, indent=1), encoding="utf-8"
-        )
+        _record(self.folder, f"{datetime.fromtimestamp(now):%Y-%m-%d}-{person.id}", done)
         log.info("reviewed person %d: %d learned, %d merged, %d revised, %d forgotten", person.id,
                  len(done["learned"]), len(done["merged"]), len(done["revised"]), len(done["forgot"]))
         return done
 
 
-def main() -> None:
+def main(argv: list[str] | None = None) -> None:
+    parser = argparse.ArgumentParser(prog="python -m zoe.review",
+                                     description="Review the observed people's memories now.")
+    commands = parser.add_subparsers(dest="command")
+    asked = commands.add_parser(
+        "apply", help="apply changes asked for, written like a review's answer",
+        description="Apply changes to a person's memories, written like the nightly review's answer: "
+        '{"merge": [{"keep": 12, "drop": [40, 55], "content": "..."}], "revise": [{"id": 7, "content": "..."}], '
+        '"forget": [{"id": 9, "why": "..."}], "learn": [{"kind": "fact", "content": "..."}], "summary": "..."}. '
+        "Only the person's facts, preferences, habits, goals and feedback change; any other number is ignored.",
+    )
+    asked.add_argument("file", type=Path, help="the JSON file with the changes")
+    asked.add_argument("--person", help="whose memories, by name or number; the owner's when left out")
+    asked.add_argument("--dry-run", action="store_true", help="show what would change and change nothing")
+    args = parser.parse_args(argv)
     logging.basicConfig(level=logging.INFO, format="%(asctime)s %(name)s %(levelname)s %(message)s")
     cfg = Config.from_env()
     conn = connect(cfg.db_path)
-    for summary in Reviewer(cfg).run(conn, time.time()):
-        print(summary)
+    if args.command != "apply":
+        for summary in Reviewer(cfg).run(conn, time.time()):
+            print(summary)
+        return
+    if args.person:
+        person = access.find_person(conn, args.person)
+    else:
+        person = access.resolve(conn, cfg.owner_chat).person if cfg.owner_chat else None
+    if person is None:
+        raise SystemExit(f"no such person: {args.person}" if args.person else "no owner configured: use --person")
+    answer = observer.json_object(args.file.read_text(encoding="utf-8"))
+    done, record = change(conn, person, answer, _folder(cfg), time.time(), args.dry_run)
+    print(json.dumps(done, ensure_ascii=False, indent=1))
+    print(f"recorded in {record}" if record else "dry run: nothing changed")
 
 
 if __name__ == "__main__":

@@ -93,6 +93,18 @@ def test_findings_become_readings_and_memories_wired_to_their_conversation():
         assert len(facts) == 1 and episode in {r.id for r in brain.recall([facts[0].id])}
 
 
+def test_a_key_in_what_the_observer_found_is_kept_only_as_saved():
+    key = "sk-proj-" + "a1B2c3D4e5" * 4
+    with tempfile.TemporaryDirectory() as tmp:
+        conn, owner, *_ = worker_setup(Path(tmp))
+        _chat(conn, owner.id, (41, "in", "chiave"), (42, "out", "Salvata"), at=1000.0)
+        observer.apply(conn, owner, observer.unread(conn, owner.id), [], [
+            {"kind": "fact", "content": f"La chiave di Zylo è {key}", "messages": [41]},
+        ])
+        assert [r.content for r in Brain(conn, owner.id).top("fact")] == [
+            "La chiave di Zylo è [chiave salvata in credenziali]"]
+
+
 def test_memories_from_one_conversation_are_wired_together_and_to_the_words_they_name():
     with tempfile.TemporaryDirectory() as tmp:
         conn, owner, *_ = worker_setup(Path(tmp))
