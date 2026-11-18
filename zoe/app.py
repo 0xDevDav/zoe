@@ -11,11 +11,12 @@ import threading
 import time
 from pathlib import Path
 
-from . import access, bot_setup, claude_runner, health, i18n, instance, meaning, notices, plugins, say, store
+from . import access, bot_setup, claude_runner, health, i18n, instance, meaning, notices, peers, plugins, say, store
 from .brain import Brain
 from .config import Config
 from .db import apply_schema, connect
 from .improve import Improver
+from .lessons import Lessons
 from .ingest import Poller
 from .launcher import RESTART
 from .minds import Minds
@@ -135,13 +136,15 @@ def main() -> None:
     poller = Poller(cfg, api, stop)
     threads: list[threading.Thread] = [
         poller, Planner(cfg, stop), Observer(cfg, stop), Minds(cfg, stop), Outbox(cfg, api, stop),
-        Improver(cfg, stop),
+        Improver(cfg, stop), Lessons(cfg, stop),
     ]
     if cfg.menu_url:
         try:
             threads.append(MenuServer(cfg, api, token, stop))
         except OSError as exc:
             log.error("the menu is not served: port %d: %s", cfg.menu_port, exc)
+    if listening := peers.serve(cfg, stop):
+        threads.append(listening)
     threads += [
         Worker(cfg, api, stop, transcriber=transcriber, speaker=speaker, name=f"worker-{i + 1}")
         for i in range(cfg.workers)

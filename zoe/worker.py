@@ -11,20 +11,21 @@ stuck turn is caught here, by the code that runs it.
 
 from __future__ import annotations
 
+import dataclasses
 import html
 import logging
 import sqlite3
 import threading
 import time
-from collections.abc import Callable
+from collections.abc import Callable, Sequence
 from contextlib import closing
 from datetime import datetime
 from functools import partial
 from pathlib import Path
 
 from . import (
-    access, approve, availability, choices, content, directives, files, formatting, i18n, minds, planner, prompt,
-    receipts, say, secrets, store, vocabulary,
+    access, approve, availability, choices, content, directives, files, formatting, i18n, lessons, minds, planner,
+    prompt, receipts, say, secrets, store, strength, tasks, vocabulary,
 )
 from .access import Person
 from .brain import Brain
@@ -50,7 +51,16 @@ ALBUM_WAIT = 1.5
 FOLLOWUP_POLL = 1.0
 FOLLOWUP_PAUSE = 2.5
 
-_INTERNAL = (planner.PLAN, minds.EVENT)
+_INTERNAL = store.OWN_WORK
+
+# One woken answer of a chat goes out at a time, so the next one sees it among what came after it.
+_woken_guard = threading.Lock()
+_woken: dict[int, threading.Lock] = {}
+
+
+def _woken_lock(chat_id: int) -> threading.Lock:
+    with _woken_guard:
+        return _woken.setdefault(chat_id, threading.Lock())
 
 
 def _taking_in(kind: str) -> str:
@@ -70,12 +80,26 @@ def _origin(msg: store.Message) -> dict | None:
     return None
 
 
+def _line(ran: str) -> str:
+    """The line a reply ends with to tell the model and effort its turn ran on, a block of its own; nothing
+    without them (``strength.label``). It goes on what is sent, never in what is logged or remembered."""
+    return f"\n\n<i>{html.escape(ran)}</i>" if ran else ""
+
+
+def _closed(text: str, line: str, limit: int) -> str:
+    """``text`` closed by ``line`` when both fit in ``limit``, otherwise as it is."""
+    closed = (text + line).strip()
+    return closed if len(closed) <= limit else text
+
+
 def _speaker(msg: store.Message, person: Person) -> str:
     """Who a message comes from, as remembered in episodes."""
     if msg.kind == planner.PLAN:
         return "Plan"
     if msg.kind == minds.EVENT:
         return f"Parallel mind #{(msg.payload or {}).get('mind')}"
+    if msg.kind == tasks.TASK:
+        return f"Program «{tasks.origin(msg.payload)}»"
     return person.name
 
 
@@ -126,8 +150,11 @@ class Worker(threading.Thread):
         log.info("%s stopped", self.name)
 
     def _recover(self, conn: sqlite3.Connection, msg: store.Message) -> None:
-        """After a turn broke: retry it or set it aside, without ever stopping the worker."""
+        """After a turn broke: retry it or set it aside, without ever stopping the worker. A turn that
+        broke after its reply was delivered stays answered: another try would answer the person twice."""
         try:
+            if store.answered(conn, msg.id):
+                return
             person = access.get_person(conn, msg.person_id)
             if person is None:
                 store.mark(conn, msg.id, "failed")
@@ -137,6 +164,16 @@ class Worker(threading.Thread):
             log.exception("message %d stays in progress until the next start", msg.id)
 
     def _handle(self, conn: sqlite3.Connection, msg: store.Message) -> None:
+        """Run the turn of a message. A program's task goes instead to the mind at work on the same thing,
+        when there is one (``tasks.py``)."""
+        if msg.kind != tasks.TASK:
+            self._turn(conn, msg)
+            return
+        with tasks.deciding(msg):
+            if tasks.pass_on(conn, msg) is None:
+                self._turn(conn, msg)
+
+    def _turn(self, conn: sqlite3.Connection, msg: store.Message) -> None:
         person = access.get_person(conn, msg.person_id)
         if person is None:
             store.mark(conn, msg.id, "skipped")
@@ -189,6 +226,7 @@ class Worker(threading.Thread):
                 chosen=first.kind == "choice", telegram_id=first.telegram_id,
                 plan=first.payload if first.kind == planner.PLAN else None,
                 mind=first.payload if first.kind == minds.EVENT else None,
+                task=first.payload if first.kind == tasks.TASK else None,
                 reply=(first.payload or {}).get("reply"),
                 followups=[(m.telegram_id, text, (m.payload or {}).get("reply")) for m, text in read[1:]], key=key,
                 temp_file_days=self._cfg.temp_file_days, archive=self._cfg.db_path,
@@ -210,34 +248,52 @@ class Worker(threading.Thread):
             # The turn ran and only its delivery failed: deliver the same answer, with its own key.
             result, key = Result(True, stored["text"], False, False, 0, 0.0), stored["key"]
         else:
-            result = self._converse(conn, brain, person, read, prompt_text, profile, progress, fresh, session)
+            choice = strength.record(conn, strength.for_turn(self._cfg, first.kind), "chat",
+                                     chat_id=first.chat_id, message_id=first.id)
+            result = self._converse(conn, brain, person, read, prompt_text, profile, progress, fresh, session, choice)
+            strength.ended(conn, choice.id, strength.outcome(result), result.duration)
         sent = None
+        ran = strength.of_turn(conn, self._cfg, person.language, first.chat_id, first.id)
         try:
-            sent = self._finish(conn, brain, person, read, recalled, result, spoken, key, progress)
+            sent = self._finish(conn, brain, person, read, recalled, result, spoken, key, progress, ran=ran)
         finally:
             if result.later:
-                threading.Thread(target=self._follow, args=(result.later, person.id, read, key, sent),
+                threading.Thread(target=self._follow, args=(result.later, person.id, read, key, sent, profile, ran),
                                  name=f"{self.name}-later-{first.id}", daemon=True).start()
 
     def _follow(self, later: Later, person_id: int, read: list[tuple[store.Message, str]], key: str,
-                sent: int | None) -> None:
+                sent: int | None, profile: Profile, ran: str = "") -> None:
         """Deliver what a turn's session says after its answer, once the background tasks it
         waits for end, as further replies of the same turn: each is delivered, remembered and
         acted on like the first, in writing and with no progress message, and takes the place of
         the turn's latest message (``sent`` at first), so the chat keeps one message for the work.
+        The session hears nothing said meanwhile: when the chat went on without it, a copy of the
+        session told what it missed writes the answer again or sends nothing (``_catch_up``), and
+        the woken answers of a chat go out one at a time, so the next one sees those before it.
         Work stopped before it ends is told to the person, except when the service stops: then a
         plan due at once takes the waits up again after the start. The chat is free meanwhile: the next message
         starts a turn and a session of its own, since only a stuck turn resumes its session."""
         conn = connect(self._cfg.db_path)
+        chat_id = read[0][0].chat_id
         try:
+            # What the session saw: the person's messages up to the last one the turn read, everything up to
+            # what the turn sent, and later what it delivered while nothing else came.
+            heard, told = read[-1][0].id, store.last_logged(conn, chat_id)
             with closing(later.answers(self._halt)) as answers:
                 for result in answers:
                     person = access.get_person(conn, person_id)
                     if person is None:
                         break
                     if result.ok and result.text:
-                        sent = self._finish(conn, Brain(conn, owner=person.id), person, read, prompt.Recall([], []),
-                                            result, False, key, replacing=sent) or sent
+                        with _woken_lock(chat_id):
+                            missed = store.unseen(conn, chat_id, heard, told)
+                            if missed:
+                                result = self._catch_up(conn, person, read, result, missed, sent, key, profile)
+                            sent = self._finish(conn, Brain(conn, owner=person.id), person, read,
+                                                prompt.Recall([], []), result, False, key, replacing=sent, ran=ran,
+                                                woken=True) or sent
+                            if not missed:
+                                told = store.last_logged(conn, chat_id)
                     elif result.cancelled and self._halt.is_set():
                         self._resume_after_stop(conn, person, read, later.waits(), result.duration)
                     elif not result.ok:
@@ -249,6 +305,28 @@ class Worker(threading.Thread):
             log.exception("background work of message %d not followed to its end", read[0][0].id)
         finally:
             conn.close()
+
+    def _catch_up(self, conn: sqlite3.Connection, person: Person, read: list[tuple[store.Message, str]],
+                  answer: Result, missed: list[dict], sent: int | None, key: str, profile: Profile) -> Result:
+        """The answer of a woken session whose chat went on without it, written again by a copy of that
+        session told the messages it ``missed``: it may take them in, or send nothing when the work is
+        already closed. The session itself goes on waiting for its other tasks. A copy that cannot run,
+        or that a stop of the service ends, lets the answer go as it was."""
+        msg = read[0][0]
+        if not answer.session_id:
+            return answer
+        choice = strength.record(conn, strength.for_turn(self._cfg, msg.kind), "chat",
+                                 chat_id=msg.chat_id, message_id=msg.id)
+        copy = dataclasses.replace(profile, args=(*profile.args, "--resume", answer.session_id, "--fork-session"))
+        result = self._runner.run(prompt.caught_up(conn, person, msg.chat_id, missed, sent, key), copy,
+                                  cancel=self._halt, model=choice.model, effort=choice.effort)
+        strength.ended(conn, choice.id, strength.outcome(result), result.duration)
+        if result.ok and result.text:
+            log.info("woken answer of message %d written again with %d message(s) it had missed", msg.id, len(missed))
+            return result
+        log.warning("woken answer of message %d not written again (rc=%s): it goes as it was", msg.id,
+                    result.returncode)
+        return answer
 
     def _resume_after_stop(self, conn: sqlite3.Connection, person: Person,
                            read: list[tuple[store.Message, str]], waits: list[str], duration: float) -> None:
@@ -322,8 +400,9 @@ class Worker(threading.Thread):
         progress: Progress,
         fresh: Callable[[], tuple[str, prompt.Recall]],
         session: str = "",
+        choice: strength.Choice | None = None,
     ) -> Result:
-        """Run the turn, from the start or resuming ``session``. Messages the person writes
+        """Run the turn, from the start or resuming ``session``, on the model and effort of ``choice``. Messages the person writes
         meanwhile stop it once they pause and no command is running, join ``read``, and the
         same session resumes with them, in a plan's or a mind's news turn too."""
         while True:
@@ -336,7 +415,8 @@ class Worker(threading.Thread):
             run_profile = Profile(profile.args + ("--resume", session), profile.cwd, profile.env) if session else profile
             try:
                 result = self._runner.run(prompt_text, run_profile, on_step=progress.step, interrupt=interrupt,
-                                          follow_for=self._cfg.claude_background_timeout)
+                                          follow_for=self._cfg.claude_background_timeout,
+                                          model=choice.model if choice else "", effort=choice.effort if choice else "")
             finally:
                 done.set()
                 watcher.join()
@@ -411,9 +491,14 @@ class Worker(threading.Thread):
         key: str,
         progress: Progress | None = None,
         replacing: int | None = None,
+        ran: str = "",
+        woken: bool = False,
     ) -> int | None:
         """Deliver a turn's result and act on it; return the Telegram id of the message that
-        holds the reply, if any. With ``replacing``, the reply takes the place of that message."""
+        holds the reply, if any. With ``replacing``, the reply takes the place of that message.
+        ``ran`` labels the model and effort the turn ran on: the written reply ends with it, or
+        the first file sent when nothing is written. A plan's run, unless the person wrote during
+        it, and what a session says when ``woken`` from its wait may send nothing."""
         msg, last = read[0][0], read[-1][0]
         reason = unavailable(result)
         if reason:
@@ -424,34 +509,37 @@ class Worker(threading.Thread):
             reply, found = directives.extract(result.text, key)
             for term, heard in directives.corrections(found):
                 vocabulary.learn_correction(brain, term, heard)
-            # A plan may send nothing, unless the person wrote during its turn and waits for the reply.
-            skipped = directives.skip(found) if msg.kind == planner.PLAN and len(read) == 1 else None
+            skippable = woken or (msg.kind in (planner.PLAN, tasks.TASK) and len(read) == 1)
+            skipped = directives.skip(found) if skippable else None
             try:
                 outcome, sent_id = (f"[sent nothing: {skipped}]", None) if skipped else self._reply(
-                    conn, person, last, reply, found, spoken, _origin(msg), progress, replacing
+                    conn, person, last, reply, found, spoken, _origin(msg), progress, replacing, ran
                 )
             except TelegramError:
                 store.note(conn, msg.id, "answer", {"text": result.text, "key": key})
                 raise
             for done, _ in read:
                 store.mark(conn, done.id, "answered")
-            keep = partial(secrets.keep, self._cfg)
-            store.mask_secrets(conn, [done.id for done, _ in read], keep)
-            said = "\n".join(f"{prompt.anchor(m.telegram_id)}{_speaker(m, person)}: {text}" for m, text in read)
+            # The reply is delivered: each step from here on runs whatever became of the ones before it.
+            after = partial(self._after, msg.id)
+            after("masking the keys in its messages", store.mask_secrets, conn, [done.id for done, _ in read],
+                  partial(secrets.keep, self._cfg))
             shown = [r.id for r in recalled.memories]
             used = [n for n in directives.used(found) if n in shown]
-            brain.reinforce(used, [n for n in shown if n not in used])
-            context = [*recalled.origins, *used]
-            remembered = f"{said}\n{prompt.anchor(sent_id)}Zoe: {outcome}"
-            keep(secrets.found(remembered), f"message {msg.id}")
-            episode = brain.learn("episode", secrets.mask(remembered, person.language), related=context)
+            after("learning from the memories it used", brain.reinforce, used, [n for n in shown if n not in used])
+            related = [*recalled.origins, *used]
+            episode = after("remembering it", self._remember, brain, person, read, outcome, sent_id, related)
+            if episode:
+                related = [episode, *related]
             receipt = receipts.Receipt(person.language)
-            self._plan(conn, brain, person, msg.chat_id, found, [episode, *context], receipt)
-            self._files(conn, brain, person, msg.chat_id, found, [episode, *context], receipt)
+            after("its plans", self._plan, conn, brain, person, msg.chat_id, found, related, receipt)
+            after("its files", self._files, conn, brain, person, msg.chat_id, found, related, receipt,
+                  "" if sent_id else ran)
             if person.role == "owner":
-                self._mind(conn, brain, person, last, found, [episode, *context])
-                self._admit(conn, person, msg.chat_id, found, receipt)
-            receipt.send(self._api, msg.chat_id)
+                after("its parallel minds", self._mind, conn, brain, person, last, found, related, tasks.keys(msg))
+                after("its admissions", self._admit, conn, person, msg.chat_id, found, receipt)
+                after("noting it as finished work", lessons.note, conn, "chat", result.session_id)
+            after("its receipt", receipt.send, self._api, msg.chat_id)
             log.info("answered message %d for person %d in %.1fs", msg.id, person.id, result.duration)
             return sent_id
 
@@ -479,6 +567,25 @@ class Worker(threading.Thread):
         log.error("message %d failed (rc=%s): %s", msg.id, result.returncode, result.failure[:200])
         self._retry_or_give_up(conn, person, msg, "error_notice")
 
+    @staticmethod
+    def _after(message_id: int, what: str, step: Callable, *args: object) -> object:
+        """Run one step of what follows a delivered reply and return what it gives. A step that breaks is
+        logged and gives None: the reply stays delivered, and the steps after it run all the same."""
+        try:
+            return step(*args)
+        except Exception:
+            log.exception("message %d is answered, but %s broke", message_id, what)
+            return None
+
+    def _remember(self, brain: Brain, person: Person, read: list[tuple[store.Message, str]], outcome: str,
+                  sent_id: int | None, related: list[int]) -> int:
+        """Keep a turn as an episode, what was said and what the person got, wired to what it came up
+        with; return the episode."""
+        said = "\n".join(f"{prompt.anchor(m.telegram_id)}{_speaker(m, person)}: {text}" for m, text in read)
+        remembered = f"{said}\n{prompt.anchor(sent_id)}Zoe: {outcome}"
+        secrets.keep(self._cfg, secrets.found(remembered), f"message {read[0][0].id}")
+        return brain.learn("episode", secrets.mask(remembered, person.language), related=related)
+
     def _reply(
         self,
         conn: sqlite3.Connection,
@@ -490,17 +597,20 @@ class Worker(threading.Thread):
         origin: dict | None,
         progress: Progress | None = None,
         replacing: int | None = None,
+        ran: str = "",
     ) -> tuple[str, int | None]:
         """Send the reply, its reaction, its options and the texts to forward; return what the
         person got, as remembered, and the Telegram id of the first message sent. The reaction
         goes on ``msg``, the turn's latest message, and what is sent notes the turn's ``origin``.
         With ``replacing``, a written reply takes the place of that earlier message of Zoe's: edited
-        in place while nothing came after it, otherwise deleted and sent anew below."""
+        in place, options included, while nothing came after it and it is not spoken, otherwise
+        deleted and sent anew below. The written reply ends with the line of ``ran``; a reaction
+        and a text to forward never carry it."""
         wanted = directives.reaction(found)
         reacted = self._react(msg, wanted)
         drafts = directives.forwards(found)
         if wanted and not reacted and not reply and not drafts:
-            reply = wanted
+            reply, ran = wanted, ""
         options = directives.options(found)
         if options and not reply:
             reply = i18n.t(person.language, "choose_prompt")
@@ -513,7 +623,7 @@ class Worker(threading.Thread):
         # An edit changes the draft to forward when there is one, otherwise the reply is the new text.
         if target and (drafts or (reply and not voiced and not options)):
             text = drafts[0] if drafts else reply
-            if self._rewrite(conn, msg, text, target):
+            if self._rewrite(conn, msg, text, target, "" if drafts else ran):
                 said.append(f"[rewrote #{target}] {text}")
                 if drafts:
                     drafts = drafts[1:]
@@ -524,15 +634,16 @@ class Worker(threading.Thread):
                 # What else is said answers the rewritten message, so the person finds it.
                 quoted = target
         sent_id = None
-        if replacing and not target and reply and not voiced and not options:
-            if store.latest(conn, msg.chat_id, replacing) and self._rewrite(conn, msg, reply, replacing):
+        if replacing and not target and reply:
+            if not voiced and store.latest(conn, msg.chat_id, replacing) \
+                    and self._rewrite(conn, msg, reply, replacing, ran, options):
                 said.append(f"[rewrote #{replacing}] {reply}")
                 sent_id, reply = replacing, ""
             elif (store.find_message(conn, msg.chat_id, replacing) or {}).get("mine"):
                 self._api.delete_message(msg.chat_id, replacing)
         if reply:
             said.append(reply)
-            sent_id = self._deliver(conn, msg, person, reply, voiced, options, quoted, origin, progress)
+            sent_id = self._deliver(conn, msg, person, reply, voiced, options, quoted, origin, progress, ran)
         # A text to forward comes bare, as a message of its own the person can forward as it is.
         for draft in drafts:
             said.append(f"[to forward] {draft}")
@@ -544,16 +655,34 @@ class Worker(threading.Thread):
             store.record_outbound(conn, msg.chat_id, None, f"[reaction {reacted}]", person.id)
         return reacted or "", None
 
-    def _rewrite(self, conn: sqlite3.Connection, msg: store.Message, text: str, target: int) -> bool:
-        """Put the text in place of one of Zoe's own messages of this chat; return False when that
-        message cannot take it (not Zoe's, not text, or a text longer than one message)."""
+    def _rewrite(
+        self, conn: sqlite3.Connection, msg: store.Message, text: str, target: int, ran: str = "",
+        options: list[str] = (),
+    ) -> bool:
+        """Put the text in place of one of Zoe's own messages of this chat, with one button per
+        option under it and none otherwise; return False when that message cannot take it (not
+        Zoe's, not text, or a text longer than one message). A message that ended with the line
+        on its turn's model and effort ends with the line of ``ran``; any other, such as a text to
+        forward or a program's message, stays without one."""
         found = store.find_message(conn, msg.chat_id, target)
-        chunks = formatting.split(formatting.to_telegram(text))
-        if not found or not found["mine"] or len(chunks) != 1:
+        if not found or not found["mine"]:
             return False
-        if not self._api.edit_message(msg.chat_id, target, chunks[0]):
+        signed = found["payload"].get("strength_line")
+        line = _line(ran) if signed else ""
+        chunks = formatting.split(formatting.to_telegram(text), formatting.MESSAGE_LIMIT - len(line))
+        if len(chunks) != 1:
             return False
-        store.revise_outbound(conn, msg.chat_id, target, chunks[0])
+        choice = choices.create(conn, msg.chat_id, msg.person_id, options) if options else None
+        if not self._api.edit_message(msg.chat_id, target, chunks[0] + line,
+                                      choices.keyboard(choice, options) if choice else None):
+            if choice:
+                choices.discard(conn, choice)
+            return False
+        store.revise_outbound(conn, msg.chat_id, target, choices.logged(chunks[0], options) if options else chunks[0])
+        if choice:
+            choices.attach(conn, choice, target)
+        if signed and not line:
+            store.note(conn, found["id"], "strength_line", False)
         return True
 
     def _plan(
@@ -591,9 +720,11 @@ class Worker(threading.Thread):
         last: store.Message,
         found: list[tuple[str, str]],
         related: list[int],
+        keys: Sequence[str] = (),
     ) -> None:
-        """Start, instruct and stop the parallel minds the reply asked for. The menu shows
-        them, so a note passed on is only a ✍ on the person's message."""
+        """Start, instruct and stop the parallel minds the reply asked for; those it starts take on the
+        ``keys`` of the task the turn ran for. The menu shows them, so a note passed on is only a ✍ on the
+        person's message."""
         for mind_id in directives.stops(found):
             minds.stop(conn, person.id, mind_id)
         for mind_id, note in directives.tells(found):
@@ -602,7 +733,8 @@ class Worker(threading.Thread):
             else:
                 log.warning("note for parallel mind %d not delivered: it is not working", mind_id)
         for title, folder, brief in directives.minds(found):
-            mind_id = minds.start(conn, brain, person, last.chat_id, title, brief, folder, related, self._cfg.data_dir)
+            mind_id = minds.start(conn, brain, person, last.chat_id, title, brief, folder, related, self._cfg.data_dir,
+                                  keys)
             log.info("parallel mind %d started for person %d: %s", mind_id, person.id, title)
 
     def _files(
@@ -614,9 +746,12 @@ class Worker(threading.Thread):
         found: list[tuple[str, str]],
         related: list[int],
         receipt: receipts.Receipt,
+        ran: str = "",
     ) -> None:
-        """Keep, delete and send the files the reply asked for."""
+        """Keep, delete and send the files the reply asked for. The line of ``ran``, given when no
+        written reply carried it, goes under the first caption with room for it."""
         home = access.turn_profile(person, self._cfg).cwd
+        line = _line(ran)
         for number, about, place in directives.keeps(found):
             kept = files.keep(conn, brain, person, number, about, place, home, related)
             if kept:
@@ -629,15 +764,19 @@ class Worker(threading.Thread):
                 receipt.discarded(gone)
         for target, caption, uncompressed in directives.sends(found):
             chosen = files.resolve_all(conn, person, target, home)
+            written = formatting.to_telegram(caption)
+            shown = _closed(written, line, CAPTION_LIMIT)
             try:
                 if not chosen:
                     raise TelegramError("no such file of this person")
-                sent = files.send(self._api, chat_id, chosen, formatting.to_telegram(caption), uncompressed)
+                sent = files.send(self._api, chat_id, chosen, shown, uncompressed)
             except TelegramError as exc:
                 log.warning("file %r not sent to %s: %s", target, chat_id, exc)
                 notice = "files_not_sent" if "," in target else "file_not_sent"
                 self._api.notify(chat_id, i18n.t(person.language, notice, what=html.escape(target)))
                 continue
+            if shown != written:
+                line = ""
             for n, ((record, path), message) in enumerate(zip(chosen, sent)):
                 name = record.name if record else path.name
                 store.record_outbound(conn, chat_id, message.get("message_id"),
@@ -689,9 +828,10 @@ class Worker(threading.Thread):
         if msg.kind not in _INTERNAL:
             self._api.notify(msg.chat_id, i18n.t(person.language, notice))
             return
-        # A plan or a mind's news is never lost: without a turn, it reaches the person as it is.
-        key = "plan_fallback" if msg.kind == planner.PLAN else "mind_fallback"
-        title = html.escape((msg.payload or {}).get("title", ""))
+        # A plan, a mind's news or a task is never lost: without a turn, it reaches the person as it is.
+        key = {planner.PLAN: "plan_fallback", tasks.TASK: "task_fallback"}.get(msg.kind, "mind_fallback")
+        title = tasks.origin(msg.payload) if msg.kind == tasks.TASK else (msg.payload or {}).get("title", "")
+        title = html.escape(title)
         text = i18n.t(person.language, key, what=html.escape(msg.text or ""), title=title)
         try:
             sent = self._api.send_message(msg.chat_id, text)
@@ -721,12 +861,15 @@ class Worker(threading.Thread):
         quoted: int | None,
         origin: dict | None,
         progress: Progress | None = None,
+        ran: str = "",
     ) -> int | None:
         """Send the reply: as a voice note when asked for and possible, otherwise as formatted
         text, with one button per option on its last part when it asks to choose, answering
         the quoted message if any. Text that answers no quoted message takes the place of the
         progress message. Every message sent is logged with its Telegram id and ``origin``;
-        return the id of the first."""
+        return the id of the first. The line of ``ran`` closes the last part of the text, noted
+        on its log as ``strength_line``; under a voice note it is written with the text, never spoken."""
+        line = _line(ran)
         if spoken and not options and self._speaker is not None and len(text) <= self._cfg.tts_max_chars:
             if progress:
                 progress.step(Step("recording"))
@@ -735,7 +878,7 @@ class Worker(threading.Thread):
                 # The text goes under the voice note, to read again; a text too long for a caption
                 # is heard only (spoken replies are one to three sentences).
                 written = formatting.to_telegram(text)
-                caption = written if len(written) <= CAPTION_LIMIT else ""
+                caption = _closed(written if len(written) <= CAPTION_LIMIT else "", line, CAPTION_LIMIT)
                 sent = self._api.send_voice(msg.chat_id, audio, reply_to=quoted, caption=caption)
                 store.record_outbound(conn, msg.chat_id, sent.get("message_id"), text, person.id, origin)
                 if progress:
@@ -744,18 +887,20 @@ class Worker(threading.Thread):
             except (SpeechError, TelegramError) as exc:
                 log.warning("voice reply failed, sending text instead: %s", exc)
         choice = choices.create(conn, msg.chat_id, person.id, options) if options else None
-        chunks = formatting.split(formatting.to_telegram(text))
+        chunks = formatting.split(formatting.to_telegram(text), formatting.MESSAGE_LIMIT - len(line))
         ids: list[int | None] = []
         for index, chunk in enumerate(chunks):
             last = index == len(chunks) - 1
+            shown = chunk + line if last else chunk
             buttons = choices.keyboard(choice, options) if choice and last else None
-            sent_id = progress.become(chunk, buttons) if progress and not ids and not quoted else None
+            sent_id = progress.become(shown, buttons) if progress and not ids and not quoted else None
             if sent_id is None:
                 sent_id = self._api.send_message(
-                    msg.chat_id, chunk, buttons=buttons, reply_to=None if ids else quoted
+                    msg.chat_id, shown, buttons=buttons, reply_to=None if ids else quoted
                 ).get("message_id")
             logged = choices.logged(chunk, options) if options and last else chunk
-            store.record_outbound(conn, msg.chat_id, sent_id, logged, person.id, origin)
+            noted = {**(origin or {}), "strength_line": True} if line and last else origin
+            store.record_outbound(conn, msg.chat_id, sent_id, logged, person.id, noted)
             ids.append(sent_id)
         if progress:
             progress.finish()

@@ -7,6 +7,7 @@ import sys
 import tempfile
 import threading
 import time
+from contextlib import contextmanager
 from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
@@ -157,17 +158,23 @@ print(json.dumps({"type": "result", "result": os.environ.get("BASH_MAX_TIMEOUT_M
 '''
 
 
-def test_a_turn_that_answers_first_lets_no_command_hold_it_past_the_foreground_limit():
-    # Checks run from one of Zoe's own turns inherit the limit that turn was given.
+@contextmanager
+def no_inherited_limit():
+    """Checks run from one of Zoe's own runs inherit the limit that run was given: without it,
+    only the limit the runner sets is seen."""
     inherited = os.environ.pop("BASH_MAX_TIMEOUT_MS", None)
     try:
-        with tempfile.TemporaryDirectory() as tmp:
-            runner = ClaudeRunner(_claude(Path(tmp), ENV_CLAUDE), "model", hard_timeout=30, inactivity_timeout=20)
-            assert runner.run("ciao", Profile((), Path(tmp), {"A": "1"}), follow_for=60).text == "120000"
-            assert runner.run("ciao", Profile((), Path(tmp))).text == "none"
+        yield
     finally:
         if inherited is not None:
             os.environ["BASH_MAX_TIMEOUT_MS"] = inherited
+
+
+def test_no_command_holds_a_run_in_the_foreground_past_the_limit():
+    with no_inherited_limit(), tempfile.TemporaryDirectory() as tmp:
+        runner = ClaudeRunner(_claude(Path(tmp), ENV_CLAUDE), "model", hard_timeout=30, inactivity_timeout=20)
+        assert runner.run("ciao", Profile((), Path(tmp), {"A": "1"}), follow_for=60).text == "120000"
+        assert runner.run("ciao", Profile((), Path(tmp))).text == "120000"
 
 
 def test_events_of_unexpected_shapes_are_skipped():

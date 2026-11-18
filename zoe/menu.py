@@ -12,15 +12,17 @@ Requests name a view or an action, each with its argument after a colon:
 
     views    home, lang, plans, plan:<id>, known, learned:<kind>, memory:<id>, minds,
              mind:<id>, people[:<person id open>], request:<code>, link:<code>, improve,
-             undo, status
+             undo, status, peers, peer:<id>
     actions  lang:<code>, unplan:<id>, forget:<id>, observe:<person id>, halt:<id>,
              approve:<code>, link:<code>:<person id>, deny:<code>, add:<person id>:<user id>,
-             revoke:<user id>, remove:<person id>, make:<proposal id>, drop:<proposal id>, undo
+             revoke:<user id>, remove:<person id>, make:<proposal id>, drop:<proposal id>,
+             unlearn:<lesson id>, undo
 
 Everyone sees and deletes their own plans, sees what the observer has learned about
 them and makes Zoe forget any of it, and turns their observation on or off. Owners
 also follow and stop their parallel minds, manage people and their accounts, decide
-what Zoe proposes to improve, see how Zoe is doing and undo her last change to herself. Owners' own accounts are only shown:
+what Zoe proposes to improve and undo a lesson she kept in her guides, see how Zoe is doing, read
+her conversations with the other agents of the machine (``peers.py``) and undo her last change to herself. Owners' own accounts are only shown:
 they come from ZOE_OWNER_IDS, so no tap in the menu gives or takes an owner's powers.
 Owner-only views and actions are checked on every request, not only hidden. People
 open the menu from the chat's Menu button, or with /menu, which answers with a
@@ -37,7 +39,10 @@ import time
 from dataclasses import replace
 from datetime import date, datetime
 
-from . import access, claude_runner, evolve, health, i18n, improve, minds, observer, planner, review, signals, store
+from . import (
+    access, claude_runner, evolve, formatting, health, i18n, improve, lessons, minds, observer, peers, planner, review,
+    signals, store, strength,
+)
 from .access import Account, Person
 from .brain import Brain
 from .config import Config
@@ -50,9 +55,11 @@ log = logging.getLogger("zoe.menu")
 
 View = dict[str, object]
 
-_OWNER_VIEWS = {"minds", "mind", "people", "request", "link", "improve", "undo", "status"}
-_OWNER_ACTIONS = {"halt", "approve", "link", "deny", "add", "revoke", "remove", "make", "drop", "undo"}
+_OWNER_VIEWS = {"minds", "mind", "people", "request", "link", "improve", "undo", "status", "peers", "peer"}
+_OWNER_ACTIONS = {"halt", "approve", "link", "deny", "add", "revoke", "remove", "make", "drop", "unlearn", "undo"}
 _DECIDED = 5
+# The days of lessons the menu shows.
+_LEARNED_DAYS = 7
 # A limit used this much shows in red.
 _NEAR_LIMIT = 90
 _MIND_ICON = {"queued": "⏳", "running": "⚙️", "asking": "❓", "done": "✅", "failed": "⚠️", "stopped": "⏹️"}
@@ -202,12 +209,14 @@ class Menu:
             # A mind that planned its phases shows a bar of how far it is; the others a row.
             planned = [m for m in working if m.state == "running" and minds.progress(m)]
             if planned:
-                blocks.append({"meters": [self._meter(m, lang, to=f"mind:{m.id}") for m in planned]})
+                blocks.append({"meters": [self._meter(m, lang, f"mind:{m.id}", self._ran(conn, m, lang))
+                                          for m in planned]})
             if rest := [m for m in working if m not in planned]:
-                blocks.append(_items(*(self._working(m, lang) for m in rest)))
+                blocks.append(_items(*(self._working(m, lang, self._ran(conn, m, lang)) for m in rest)))
             if ended:
                 blocks += [{"heading": t("minds_recent")}, _items(*(
-                    _entry(m.title, self._state(m, lang, now), to=f"mind:{m.id}") for m in ended))]
+                    _entry(m.title, self._state(m, lang, now) + self._ran(conn, m, lang), to=f"mind:{m.id}")
+                    for m in ended))]
             return _view(t("btn_minds"), blocks)
 
         if name == "mind":
@@ -216,7 +225,8 @@ class Menu:
                 return gone(t("btn_minds"), "mind_gone", "minds")
             working = mind.state in minds.ACTIVE
             started = (mind.started_at or mind.created_at) if mind.state == "running" else None
-            blocks = [_text(self._state(mind, lang, time.time()), started), {"code": mind.workdir}]
+            blocks = [_text(self._state(mind, lang, time.time()) + self._ran(conn, mind, lang), started),
+                      {"code": mind.workdir}]
             if mind.state == "running" and (done := minds.progress(mind)):
                 marks = ["✅"] * done.done + ["▶️"] + ["⬜"] * (done.total - done.done - 1)
                 blocks += [{"heading": t("mind_phases")}, {"meters": [self._meter(mind, lang)]},
@@ -302,6 +312,17 @@ class Menu:
         if name == "status":
             return _view(t("btn_status"), [self._status(conn, lang), *self._limits(lang)])
 
+        if name == "peers":
+            settings = peers.load(self._cfg.data_dir)
+            return _view(peers.view_name(self._cfg, lang, settings), self._conversations(conn, settings, lang))
+
+        if name == "peer":
+            settings = peers.load(self._cfg.data_dir)
+            conversation = peers.thread(conn, int(arg)) if arg.isdigit() else None
+            if conversation is None:
+                return gone(peers.view_name(self._cfg, lang, settings), "peer_gone", "peers")
+            return _view(conversation.subject, self._conversation(conn, settings, conversation, lang), "peers")
+
         return self._home(conn, person)
 
     def _home(self, conn: sqlite3.Connection, person: Person) -> View:
@@ -315,10 +336,12 @@ class Menu:
                 _entry(t("btn_known"), to="known"), _entry(t("btn_language"), to="lang")]
         if person.role == "owner":
             working, waiting = minds.active(conn, person.id), access.pending(conn)
+            settings = peers.load(self._cfg.data_dir)
+            talks = [_entry(peers.view_name(self._cfg, lang, settings), to="peers")] if settings.peers else []
             rows = [_entry(t("btn_minds"), to="minds", count=len(working)),
                     _entry(t("btn_people"), to="people", count=len(waiting)),
                     _entry(t("btn_improve"), to="improve", count=len(improve.waiting(conn))),
-                    *rows, _entry(t("btn_status"), to="status"), _entry(t("btn_undo"), to="undo")]
+                    *talks, *rows, _entry(t("btn_status"), to="status"), _entry(t("btn_undo"), to="undo")]
         return _view(t("menu_home"), [_items(*rows)], back="")
 
     @staticmethod
@@ -345,7 +368,8 @@ class Menu:
 
     def _improvements(self, conn: sqlite3.Connection, lang: str) -> list[dict]:
         """What last night's study and memory review found, the proposals waiting, open one at a
-        time, and the last ones decided, each approved one with how its making goes."""
+        time, the lessons of the last days, and the last proposals decided, each approved one with
+        how its making goes."""
 
         def t(key: str, **kwargs: object) -> str:
             return i18n.t(lang, key, **kwargs)
@@ -358,6 +382,9 @@ class Menu:
         blocks += [{"heading": t("improve_waiting")}, {"sections": [
             self._proposal(p, lang, n == 0) for n, p in enumerate(proposals)]} if proposals else _text(t("improve_none"))]
         rows, now = [], time.time()
+        learned = lessons.recent(conn, now - _LEARNED_DAYS * 86400)
+        if learned:
+            blocks += [{"heading": t("improve_learned")}, {"sections": [self._lesson(l, lang) for l in learned]}]
         for proposal in improve.decided(conn, _DECIDED):
             mind = minds.get(conn, proposal.mind_id) if proposal.mind_id else None
             rows.append(_entry(proposal.title, self._state(mind, lang, now), to=f"mind:{mind.id}") if mind
@@ -365,6 +392,19 @@ class Menu:
         if rows:
             blocks += [{"heading": t("improve_decided")}, _items(*rows)]
         return blocks
+
+    @staticmethod
+    def _lesson(lesson: lessons.Lesson, lang: str) -> dict:
+        """A lesson kept in the guides: what changes, the guides it touched, and the tap that reverts it."""
+
+        def t(key: str, **kwargs: object) -> str:
+            return i18n.t(lang, key, **kwargs)
+
+        detail = planner.label(lesson.created_at, lang) + ("" if lesson.state == "kept" else f", {t('lesson_undone')}")
+        blocks = ([_text(lesson.what)] if lesson.what else []) + [{"quote": "\n".join(lesson.files)}]
+        if lesson.state == "kept":
+            blocks.append(_button(t("btn_unlearn"), f"unlearn:{lesson.id}", "danger", t("confirm_unlearn")))
+        return {"title": lesson.title, "detail": detail, "open": False, "blocks": blocks}
 
     @staticmethod
     def _proposal(proposal: Proposal, lang: str, opened: bool) -> dict:
@@ -391,22 +431,82 @@ class Menu:
             question=mind.question,
         )
 
+    def _ran(self, conn: sqlite3.Connection, mind: minds.Mind, lang: str) -> str:
+        """What closes a line about a mind to tell the model and effort it runs on; nothing before
+        they are chosen, or while they are not shown."""
+        ran = strength.of_mind(conn, self._cfg, lang, mind.id)
+        return f" · {ran}" if ran else ""
+
     @staticmethod
-    def _meter(mind: minds.Mind, lang: str, to: str = "") -> dict:
-        """A bar of how far a running mind is by its phases; in a list, ``to`` opens the mind."""
+    def _meter(mind: minds.Mind, lang: str, to: str = "", ran: str = "") -> dict:
+        """A bar of how far a running mind is by its phases; in a list, ``to`` opens the mind and
+        ``ran`` closes its detail."""
         done = minds.progress(mind)
         phase = i18n.t(lang, "mind_phase", number=done.done + 1, total=done.total, name=done.current)
         if not to:
             return {"label": phase, "value": f"{done.share}%", "fill": done.share}
         return {"label": f"{_MIND_ICON[mind.state]} {mind.title}", "value": f"{done.share}%", "fill": done.share,
-                "detail": f"{ELAPSED}, {phase}", "since": mind.started_at or mind.created_at, "to": to}
+                "detail": f"{ELAPSED}, {phase}{ran}", "since": mind.started_at or mind.created_at, "to": to}
 
     @staticmethod
-    def _working(mind: minds.Mind, lang: str) -> dict:
-        """A mind at work: for how long and what it is doing."""
+    def _working(mind: minds.Mind, lang: str, ran: str = "") -> dict:
+        """A mind at work: for how long and what it is doing, closed by ``ran``."""
         doing = mind.steps[-1] if mind.state == "running" and mind.steps else i18n.t(lang, f"doing_{mind.state}")
-        return _entry(f"{_MIND_ICON[mind.state]} {mind.title}", f"{ELAPSED}, {doing}", to=f"mind:{mind.id}",
+        return _entry(f"{_MIND_ICON[mind.state]} {mind.title}", f"{ELAPSED}, {doing}{ran}", to=f"mind:{mind.id}",
                       since=mind.started_at or mind.created_at)
+
+    def _conversations(self, conn: sqlite3.Connection, settings: peers.Settings, lang: str) -> list[dict]:
+        """Zoe's conversations with the other agents, the one that moved last first, under how much
+        of the limits of the day and of the hour each agent used."""
+
+        def t(key: str, **kwargs: object) -> str:
+            return i18n.t(lang, key, **kwargs)
+
+        limits, now, names = settings.limits, time.time(), peers.names(self._cfg, settings)
+        blocks = [_text(t("peers_intro", limit=limits.turns))]
+        for peer in settings.peers:
+            turns, sent = peers.usage(conn, peer.key, now)
+            blocks.append({"columns": 2, "stats": [
+                _stat(t("peers_turns"), f"{turns}/{limits.turns_day}", peer.name),
+                _stat(t("peers_messages"), f"{sent}/{limits.messages_hour}", peer.name)]})
+        rows = [_entry(c.subject, t("peer_detail", **self._told(conn, c, names, limits, lang),
+                                   when=planner.label(c.updated_at, lang)), to=f"peer:{c.id}")
+                for c in peers.threads(conn)]
+        return blocks + [_items(*rows) if rows else _text(t("peers_none"))]
+
+    @staticmethod
+    def _told(conn: sqlite3.Connection, conversation: peers.Thread, names: dict[str, str], limits: peers.Limits,
+              lang: str) -> dict[str, object]:
+        """Who opened a conversation, how many of its turns it took, and whether it goes on."""
+        return {"opener": names.get(peers.opener(conn, conversation), conversation.peer), "turns": conversation.turns,
+                "limit": limits.turns,
+                "state": i18n.t(lang, "peer_closed" if conversation.state == "closed" else "peer_open")}
+
+    def _conversation(self, conn: sqlite3.Connection, settings: peers.Settings, conversation: peers.Thread,
+                      lang: str) -> list[dict]:
+        """One conversation as a chat: Zoe's messages on the right, the agent's on the left, a line
+        marked when it asks the owner something, and who is writing while a turn waits."""
+
+        def t(key: str, **kwargs: object) -> str:
+            return i18n.t(lang, key, **kwargs)
+
+        names = peers.names(self._cfg, settings)
+
+        def said(sender: str, text: str, at: str, tone: str = "") -> dict:
+            return {"side": "right" if sender == peers.SELF else "left", "who": names.get(sender, sender),
+                    "at": at, "text": text, "tone": tone}
+
+        lines = []
+        for message in peers.messages(conn, conversation.id):
+            asks = peers.for_owner(message.text, self._cfg.owner_name)
+            lines.append(said(message.sender, formatting.to_text(message.text), planner.label(message.created_at, lang),
+                              "owner" if asks else ""))
+            if message.answers is None and message.state != "done":
+                other = conversation.peer if message.sender == peers.SELF else peers.SELF
+                lines.append(said(other, t("peer_writing" if message.state == "waiting" else "peer_no_answer"), "",
+                                  "waiting"))
+        head = _text(t("peer_head", **self._told(conn, conversation, names, settings.limits, lang)))
+        return [head, {"chat": lines}] if lines else [head]
 
     def _status(self, conn: sqlite3.Connection, lang: str) -> dict:
         """How the service is doing, card by card: whether Claude can work and with which model,
@@ -508,6 +608,10 @@ class Menu:
 
         if name == "drop":
             return then("improve", "dropped" if arg.isdigit() and improve.drop(conn, int(arg)) else "proposal_gone")
+
+        if name == "unlearn":
+            done = arg.isdigit() and lessons.undo(conn, self._cfg, int(arg))
+            return then("improve", "unlearned" if done else "unlearn_failed")
 
         if name == "undo":
             try:

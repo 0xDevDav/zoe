@@ -26,7 +26,7 @@ import sqlite3
 import threading
 import time
 
-from . import access, i18n, review, secrets, signals, vocabulary
+from . import access, i18n, review, secrets, signals, store, vocabulary
 from .access import Person
 from .brain import Brain, Recalled
 from .claude_runner import ClaudeRunner, Profile
@@ -89,7 +89,7 @@ def unread(conn: sqlite3.Connection, person_id: int, limit: int = BATCH) -> list
     before any message of theirs still waiting for its turn."""
     return conn.execute(
         "SELECT id, telegram_id, direction, text, created_at FROM messages "
-        "WHERE person_id = ? AND state = 'answered' AND text IS NOT NULL AND kind NOT IN ('plan', 'mind') "
+        f"WHERE person_id = ? AND state = 'answered' AND text IS NOT NULL AND {store.NOT_OWN_WORK} "
         "AND id > COALESCE((SELECT cursor FROM observation WHERE person_id = ?), 0) "
         "AND id < COALESCE((SELECT MIN(id) FROM messages WHERE person_id = ? "
         "                   AND state IN ('received', 'processing')), 9e18) "

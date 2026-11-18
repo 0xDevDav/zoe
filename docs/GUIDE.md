@@ -86,9 +86,9 @@ keeps only the conversation. The chat's Menu button opens it, and `/menu`
 change language, see or delete what is scheduled for them and see what Zoe has
 learned about them. Owners also follow and stop parallel minds, manage people
 (one person open at a time, the owner first, each with their accounts) and who
-tried to write, decide what Zoe proposes to improve, undo her last change to
-herself, and see her status as cards: since when she runs, version and model,
-whether Claude can work, turns running and queued, parallel minds at work, the
+tried to write, decide what Zoe proposes to improve, undo a lesson she kept in
+her guides or her last change to herself, and see her status as cards: since
+when she runs, version and model, whether Claude can work, turns running and queued, parallel minds at work, the
 last nightly review, and Claude's usage limits (the 5-hour session and the
 week, how much is used and when each resets). Every Claude run reports the
 limits along with its requests, and the status shows what the latest run
@@ -188,6 +188,36 @@ progress message while nobody writes; the person's first message brings it in
 below, and the one reply covers both Zoe's own task and what the person wrote,
 even when a plan alone would have sent nothing.
 
+## Model and effort of each turn
+
+Every chat turn, parallel mind and nightly study runs on one model,
+`ZOE_CLAUDE_MODEL` (Opus), at xhigh reasoning effort (`strength.py`): the
+person's messages, from the owner and from every other account, the plans that
+come due, notices and minds alike. A newer model takes over by changing that id.
+News from a parallel mind runs at high: it only passes on work done alone. A
+lesson review runs at high too. Nothing is weighed before a turn and no call to
+Claude chooses the effort, so a turn starts at once. `max`, the highest effort
+Claude offers, is never asked for, and an effort named in a message changes
+nothing: xhigh is already the most a turn runs at.
+
+Every run is kept in the `model_choices` table with its model, effort, outcome
+and duration, and the journal shows each choice (`zoe.strength`) and the
+command Claude starts with (`zoe.claude`). A mind that resumes keeps its row
+while the model and effort stay the same, and gets a new one otherwise.
+
+With `ZOE_SHOW_STRENGTH=1` the person sees what each run ran on. Every written
+reply ends with a line in italics such as *Opus 5.5, xhigh effort*: the model
+and effort its turn ran on, by a readable name. The service adds the line to
+what it sends, on the last part of a long reply and within Telegram's limits,
+and keeps it out of what is logged and remembered, so Zoe never reads it back.
+A reaction alone and a text to forward carry none; a voice note has it written under it, never spoken; a reply
+of files alone has it under the first caption with room for it; a message
+rewritten in place keeps one. The menu shows the same label beside each parallel
+mind, and only the menu: Zoe's reply on a mind's news names no model or effort
+of the mind, and ends with the line of its own turn.
+Notices and messages from programs stay as they are. Off, as by default,
+nothing shows them.
+
 ## Directives
 
 Claude acts on the service by adding directives to a reply, which are removed
@@ -283,10 +313,21 @@ piece of research, Zoe answers at once and hands it to a parallel mind: a
 separate Claude run with her powers, in its own folder, allowed hours rather
 than minutes. The chat stays free, and the owner can ask her anything else.
 
-- Zoe writes the brief with `[[KEY mind: Title | folder]] ... [[/mind]]`: the goal,
-  where to work, constraints, and how to verify the work. The mind does not see
-  the chat, so the brief carries everything it needs, and its first prompt adds
-  what Zoe remembers about the task.
+- Zoe writes the brief with `[[KEY mind: Title | folder]] ... [[/mind]]`, and
+  keeps it short: the result expected, where to work, the constraints that are
+  real, who tries the result, and the one or two checks that matter. The mind
+  does not see the chat, so the brief says what it cannot find out alone, and
+  its first prompt adds what Zoe remembers about the task. How to do the work
+  is left to the mind.
+- A mind works in proportion to its task. It studies and checks by what a
+  mistake would cost and how soon the person would see it: what they try for
+  themselves in seconds and is easily redone, such as a screen, an app, a
+  graphic or a text, is built, opened once and handed over with what was not
+  tried. Full tests are for where a mistake costs: money, messages to other
+  people, data that cannot be recovered, services that are running. A test rig
+  is never larger than the change, and one that breaks is not repaired at
+  length: the mind hands the work over and says what is not tested. It runs at
+  xhigh effort (see "Model and effort of each turn").
 - Up to `ZOE_MINDS` minds work at once; the others wait their turn.
 - A mind works only with the owner's own Claude settings, never with those of
   the folder it works in: a downloaded project's hooks, MCP servers and
@@ -303,18 +344,50 @@ than minutes. The chat stays free, and the owner can ask her anything else.
 - `[[KEY tell: 3 | text]]` passes a note to a working mind: the run is interrupted
   and resumes its session with the note, and the person's message gets a ✍.
   `[[KEY stop: 3]]` stops it.
+- A mind started in the turn of a program's task takes on the task's keys, and
+  later tasks on the same thing come to it as notes (see "Tasks for Zoe herself").
+- A mind tells the result before it closes the work. As soon as what was asked
+  is done and checked it sends news of it (what is done, where to see it, what
+  waits for the person) and goes on with the closing work (guides, memory, a
+  commit, cleanup), which it keeps in a last phase of its own, so the bar
+  shows that the result is there. Zoe tells the person within minutes, and
+  when the mind finishes she tells only what its report adds to that news.
+- What a mind tells while it works (its phases, the phase it starts, its
+  news) travels in a command: the mind launches a Bash command of its own that
+  holds the lines, such as `[[KEY news: text]]`, a `cat` of a quoted
+  here-document so the shell reads nothing in the text, and the service takes
+  them from the command in the stream of the mind's own tools, the moment it
+  starts. Lines that come together, such as news and the phase that starts
+  with it, share one command. A command always reaches the service, while
+  what a mind writes between two commands may stay in its thinking and never
+  arrive as text, so a line written as text is not read. Only the mind holds
+  its key and only its own commands are read: what a command prints, a file,
+  a page or a message the mind reads, and any other process send nothing, and
+  neither does the news of a mind that was stopped.
+- A mind that saved or published work and five minutes later has still sent no
+  news is asked for it, once: its run is interrupted as soon as no command is
+  running and resumes its session with the request to tell now what is done,
+  where it shows and what is still coming, before the closing work goes on.
+  A mind whose news arrived is never asked.
+  Saving or publishing means launching `git commit` or one of the owner's own
+  commands listed in `ZOE_PUBLISH_COMMANDS`, separated by commas, with `*` for
+  any one word (`site-publish, shop * deploy`). A command that only names one,
+  such as `cat` of its script or `git log`, does not count.
+- Something small a note asks for on the work in progress is done first and
+  told with a news command the same way, instead of with the final report.
 - A mind that needs a decision ends with `[[KEY ask: question]]`. The question
   reaches Zoe in the chat, she asks the person, and the answer resumes the mind.
-- When a mind finishes, fails or asks, the news joins its chat's queue like a
-  plan: it waits for the turn in progress, and Zoe tells the person in her own
-  words. The task is a neuron wired to the conversation it came from, and a
-  reply to the news leads back to it.
+- When a mind finishes, fails, asks or sends news while it works, the news
+  joins its chat's queue like a plan: it waits for the turn in progress, and
+  Zoe tells the person in her own words. The task is a neuron wired to the
+  conversation it came from, and a reply to the news leads back to it.
 - A mind never writes to the chat itself, even when its brief asks: its report
   gives the full path of every file to show, and Zoe sends them with the news,
   so whatever the person sees passes through her and stays in the chat log.
 - A mind plans its work in a few phases with `[[KEY phases: Read | Write | Test]]`
-  and marks the one it starts with `[[KEY phase: 2]]`; when a fix needs a phase
-  of its own, it writes the whole list again. A task of a few minutes plans none.
+  in its first command and marks the one it starts with `[[KEY phase: 2]]`,
+  saved the moment its command starts; when a fix needs a phase of its own, it
+  sends the whole list again. A task of a few minutes plans none.
 - In the menu, "Parallel minds" lists the minds at work, each with its state, for
   how long and what it is doing, and the last ones that ended. A mind that
   planned its phases shows a bar of how far it is and the phase it works on. A
@@ -388,7 +461,9 @@ mostly carry recall along to the memories they are wired to.
   with `[[KEY used: 12, 45]]`. What a reply used is wired together and to the
   conversation, and the links that pulled in what went unused alongside it
   weaken: paths that help grow, the others fade until the nightly review prunes
-  them.
+  them. A memory merged into another while the turn worked counts as the one
+  that kept it, and one forgotten meanwhile is left out: whatever links
+  memories by their numbers reads them as the graph holds them at that moment.
 
 How well recall works is measured, not guessed. `python -m zoe.recall_eval build`
 has Claude judge, once, what a sample of the owner's real messages needed, kept
@@ -422,6 +497,32 @@ changes leave a cleaner system rather than a pile of patches.
   "Improvements" shows last night's findings and the proposals: one tap hands a
   proposal to a parallel mind that makes it and reports in the chat, another
   sets it aside for good. `python -m zoe.improve` runs a study now.
+- **She keeps what long work taught her** (`lessons.py`). The owner's workdir
+  holds the guides she follows, Markdown files in git on how to do each kind of
+  task for them. Every owner chat turn and parallel mind that finishes is noted
+  with its Claude session; beside the chat, the part of its transcript not read
+  yet is read, and the guides it read and the tools it ran are kept, so a session
+  that goes on later is read again from where it stopped. Work that ran at least
+  `ZOE_LESSON_TOOLS` tools (10 by default; 0 turns reviews off) waits for a
+  review: one at most every half hour, and at most `ZOE_LESSONS_PER_DAY` a day
+  (12 by default), reads the traces of what waits together. A correction from the owner, a way
+  that worked after trying, or a guide that was wrong becomes a change to the
+  guide that was in play, or to the one that covers the task, and only a kind of
+  task with no guide gets a new one; nothing to keep is the usual answer.
+  Lessons are rules with their reason, never dated stories; failures of the
+  moment and claims that a tool does not work are never kept. What needs code, a
+  script or a service becomes a proposal in "Improvements" at once. The review
+  has file tools only and writes only Markdown files in the workdir, with the
+  owner's hooks and approval rules and nobody to ask; a change to
+  what `ZOE_HOME/lessons-protected.txt` names (one pattern per line, relative to
+  the workdir, `*` crossing folders; a trailing ` +` lets lines be added and none
+  changed) or to a file someone else is changing is put back. Quick checks (long
+  dashes, paths that lead nowhere, a guide past 300 lines) send it back once to
+  fix what it wrote. Each lesson lands as a commit of its own and is kept in the
+  `lessons` table, nothing is said in the chat, and "Improvements" lists the
+  lessons of the last week, each undone with one tap.
+  `python -m zoe.lessons unused --days 60 [PATTERN...]` prints the guides in git
+  that no work read in that time, once their use has been counted that long.
 - **Every change goes through one pipeline** (`zoe-evolve`, on the PATH of owner
   turns and parallel minds): it is made in its own git
   worktree, never in the live files; it must pass compilation, the full test
@@ -441,7 +542,12 @@ changes leave a cleaner system rather than a pile of patches.
   add tables and columns, so an older version always runs on the newer database.
 - **Every change can be undone** from the menu, with a confirmation.
 - The launcher, the pipeline, permissions, the vault, the privacy guard, their
-  tests and the principles change only on the owner's explicit request.
+  tests and the principles change only on the owner's explicit request. Such a
+  change is reviewed and applied with `--owner-approved`, so the reviewer judges
+  it knowing the owner asked for it; apply needs the flag for a protected file
+  and accepts it only after a review run with it. Every verdict is written,
+  with the reviewer's words, to `ZOE_HOME/evolve/history.jsonl`, and apply goes
+  only by the last verdict there for the change.
 
 ## Security
 
@@ -493,22 +599,46 @@ only in instructions:
   command runs (a build, an install) is work, not a stuck turn, for up to 20
   minutes. A reply whose delivery failed is delivered again on the next try
   without running Claude again, and due plans are queued in one transaction.
+- **A delivered reply is never redone.** What follows the delivery (masking
+  pasted keys, learning from the memories used, the episode, then the plans,
+  files, parallel minds and admissions the reply asked for) runs step by step:
+  a step that breaks is logged and the ones after it run all the same, and a
+  turn that breaks once its reply is out stays answered instead of going back
+  to the queue, so the person never gets two replies to one message.
 - **A wait never holds the chat.** A turn that answers while its background
   tasks still run (a print, a render, a download) sends that answer at once and
   frees the chat; its session is followed on, silent for as long as the tasks
   run, up to `ZOE_CLAUDE_BACKGROUND_TIMEOUT` (four hours), and what Claude says
-  when they end takes the place of the turn's latest message: edited in place
-  while nothing came after it, otherwise deleted and sent anew below, so the
-  chat keeps one message for the work (a voice note or a reply with options
-  comes as a new message). Work that ends within about five minutes is not left
+  when they end takes the place of the turn's latest message: edited in place,
+  buttons included, while nothing came after it and it is not a voice note,
+  otherwise deleted and sent anew below, so the chat keeps one message for the
+  work. The session hears nothing said meanwhile: when the chat went on after
+  its last message, a copy of it (`--resume … --fork-session`) is told what it
+  missed before anything goes out, and writes the answer again or sends nothing
+  (`skip`) when there is nothing new to tell, as when a later turn closed the
+  work or stopped the wait; the session itself goes on waiting for its other
+  tasks, and a copy that cannot run lets the answer go as it was. The woken
+  answers of a chat go out one at a time, so waits that end together do not
+  repeat each other. Work that ends within about five minutes is not left
   in the background at all: the turn waits for it, with foreground checks under
-  two minutes each, and replies once with the result. A requested restart
+  two minutes each, and replies once with the result. A touch-up the person
+  sees at once and one command undoes (a text, a graphic, an alignment, a
+  figure) is done in the turn too, without a parallel mind, with the checks
+  that already exist and no new tests, and the reply says what was not tried;
+  full tests are for where a mistake costs, as for a mind. Zoe's own code and
+  skills are never such a touch-up: they change only through her pipeline. A
+  requested restart
   waits for such a session only while it replies or runs a command: one that
   only waits for its tasks is ended by the stop, and a plan due at once, with
   what it waited for and the commands behind it, takes the waits up again after
-  the start. A command left in the foreground
-  holds the turn for two minutes at most: Claude Code then moves it to the
-  background, where it is followed the same way.
+  the start.
+- **No command holds a run in the foreground for minutes.** In a turn, in a
+  parallel mind and in the nightly study alike, a command left in the
+  foreground holds Claude for two minutes at most: Claude Code then moves it to
+  the background, where it runs on, for ten more minutes at most, while the
+  session works on, and wakes the session when it ends. A turn that answered
+  is followed the same way. A long build or test suite is started in the
+  background with the time it needs, up to two hours.
 - **When Claude cannot work at all** (logged out, out of usage), which its own
   error says, never what a turn wrote: by its words, or by the error code Claude
   puts on its message (`authentication_failed`, `rate_limit`, `billing_error`,
@@ -604,12 +734,108 @@ zoe-say --silent "text"                      # without a notification sound
 zoe-say --options "Yes|No" "text"            # with one button per option
 ```
 
+Labels in square brackets that open the text or caption, such as `[invoice alert]`
+or `[backup-job]`, are for Zoe: the chat log keeps them, and the person reads the
+message without them. Brackets further on, links and commands between double
+brackets are sent as written.
+
 With `--options` (up to eight labels, text messages only) the buttons sit under
 the last part of the message, as with the choices Zoe offers herself: a tap
 reaches Zoe as the person's next message, as if they had written the label.
 
+A program sees neither the chats nor Zoe's work, so its notice may arrive in the
+middle of a conversation about the very same thing, or report what one of her
+parallel minds is doing. When the person wrote in one of their chats in the last
+three hours, or one of their minds is at work or ended in them, a text notice
+named with `--from` is first read by a short run with no tools (`linking.py`, on
+the observer's model) together with the last three hours of every chat of that
+person, from all their accounts, and with those minds, each with its folder and
+last steps:
+
+- a notice that only reports Zoe's own work, such as a test a mind sent to
+  itself, and gives the person nothing to know or do is not sent: the chat log
+  keeps it, marked `[not sent: …]`, so Zoe still knows of it;
+- a notice about a conversation or about Zoe's work that does matter goes as
+  Zoe's next message in its chat: starting from what was being said or done,
+  saying so when the work is hers, with every fact and link of the notice and no
+  question the chats or the minds already answer, and as a reply to the person's
+  message it answers when that message is in the same chat;
+- any other notice goes exactly as written.
+
+Files, voice notes, messages with buttons and messages without `--from` always go
+as written, and a quiet person costs no run. A notice is never lost or held up by
+a fault: a run that fails, answers something unreadable, drops a link or takes
+more than twenty seconds lets the notice go as written, and meanwhile only the
+later messages of that chat wait behind it.
+
+### Tasks for Zoe herself
+
+Sometimes a program finds work for Zoe rather than news for the person, such as
+an alert whose fix should start at once, without asking. It hands it over as a
+task (`tasks.py`):
+
+```
+zoe-say --task --from "site check" --key site:menu --key site:footer "text"
+```
+
+A task is queued in an owner's chat (the owner's first account unless `--chat`
+names another) and runs as a turn of Zoe's, like a plan that came due: in order
+with the chat, with every power, and with no progress message while the person
+does not write. The prompt names the program, which `--from` must give, and
+gives the text as its request. What Zoe writes goes to the person as her
+message, or she sends nothing with `skip`; a task whose turn keeps failing
+reaches the person as it is.
+
+A task gives no power a program lacks: only a program that can write Zoe's
+database can hand one, and such a program can already queue a plan due at once,
+or run Claude itself. The text is the program's own words and Zoe does what it
+says, so a program never puts in it words it got from others, such as a mail or
+a web page: it says where to read them instead.
+
+Keys name what a task is about, such as the rules an alert found broken. A
+parallel mind Zoe starts in a task's turn takes on its keys, and while that mind
+works (queued, running or waiting for an answer), a later task sharing one of
+them never becomes a turn: it goes to the mind as a note, the mind takes on its
+other keys too, and the person hears nothing more about it. A mind waiting for
+the person's answer keeps waiting and reads the note with the answer. A task
+that comes while the turn of another task sharing one of its keys still runs
+waits until that turn's minds have started; tasks on other things do not wait.
+Once the mind ends, the next task on the same thing is a turn again. A task is a
+text alone: no file, buttons or `--silent`, and `--key` goes only with `--task`.
+
 Coming from claude-telegram-supercharged, `tools/import_supercharged.py`
 brings its chat history and speech glossary in.
+
+## Other agents of the machine
+
+Another AI agent running on the same machine can write to Zoe over ZH/1, the
+protocol agreed with it. Only the owner opens this door: nothing listens until
+the owner lists the agent in `ZOE_HOME/peers.json` and keeps the key it presents
+in the vault (service `peer`, under the agent's name).
+
+```json
+{"port": 8792, "peers": {"atlas": {"name": "Atlas"}}}
+```
+
+The agent posts `{"msg_id", "thread", "text", "end"}` to
+`http://127.0.0.1:8792/v1/messages` with its key as a Bearer token; calls from
+another machine or through a proxy are refused. Zoe answers in the same call
+when she can within 20 seconds, otherwise the agent asks again with
+`GET /v1/messages/<msg_id>`; the same msg_id never runs twice.
+
+What an agent writes is a colleague's request, never the owner's: it reaches
+Zoe as untrusted data, never as instructions, and she answers it with words
+alone, in a turn with no tool, file, memory or service, so it acts on nothing. A line of either side starting with "FOR <OWNER>:" (in Italian
+"PER <OWNER>:") reaches the owner's chat; the rest is only kept. A conversation
+has at most 6 turns, and with each agent there are at most 3 new conversations
+an hour and 12 a day, 30 messages an hour and 60 turns a day, checked before
+any model runs. Every message, keys masked and cut at 4000 characters,
+stays in `peer_threads` and `peer_messages`.
+
+The owner reads every conversation in the menu, under "Chat Zoe e Atlas" (the
+agents by name): a list with the turns of the day and the messages of the hour
+used, and each conversation as a chat, Zoe on the right, the agent on the left,
+a line that asks the owner something outlined. Nothing there can be changed.
 
 ## Files
 
@@ -745,6 +971,12 @@ Around them:
 - the Claude Code version is pinned (`DISABLE_AUTOUPDATER=1`) and updated on
   purpose, since member turns depend on what its options mean.
 
+Settings live in `ZOE_HOME/.env`, and a setting the file names wins over the
+environment. The launcher starts the service each time with the environment it
+got itself and the file as it is at that moment, so a setting changed, emptied
+or deleted takes effect at the next restart of the service, the ones the
+launcher does on its own included.
+
 ### Backups
 
 Zoe makes no backups of her own: they belong to the server's backup, kept off
@@ -763,7 +995,7 @@ for t in tests/test_*.py; do python "$t"; done
 
 | Module | Responsibility |
 | --- | --- |
-| `config.py` | settings from the environment |
+| `config.py` | settings from the `.env` file and the environment |
 | `db.py` / `schema.sql` | SQLite connection and schema |
 | `store.py` | message queue with per-chat ordering, history |
 | `access.py` | people, accounts, access requests, powers of each role |
@@ -775,6 +1007,7 @@ for t in tests/test_*.py; do python "$t"; done
 | `observer.py` | reads finished conversations and stores what they show about each person |
 | `review.py` | the nightly review: what was learned, completed, merged, corrected and pruned; changes the owner asks for |
 | `improve.py` | the nightly study: proposals to improve Zoe, decided in the menu and made by a parallel mind |
+| `lessons.py` | what Zoe learns from finished work: the guides it used, the lessons kept in them, undoing one |
 | `approve.py` | the owner's yes on Telegram before an action their rules mark as asking |
 | `availability.py` | whether Claude can work at all: turns and minds wait for a usage limit to reset, owners hear it once |
 | `usage.py` | Claude's usage limits for the menu, as the latest run reported them, or from `/usage` when that is old |
@@ -784,6 +1017,7 @@ for t in tests/test_*.py; do python "$t"; done
 | `files.py` | received files: temporary unless kept, remembered when kept, sent back |
 | `ingest.py` | poller thread: authorization and routing |
 | `claude_runner.py` | run one Claude turn, stream its steps, detect stuck turns |
+| `strength.py` | the model and effort of each turn, mind and study, kept with how each ended |
 | `progress.py` | live progress message while a turn runs |
 | `style.py` | the writing standard given to every turn |
 | `formatting.py` | enforce the standard: Telegram HTML, emoji, dashes, blocks, splitting |
@@ -806,6 +1040,8 @@ for t in tests/test_*.py; do python "$t"; done
 | `instance.py` | one Zoe per home: the lock a second service cannot take |
 | `health.py` | the service's heartbeat, which the launcher trusts versions on |
 | `say.py` | zoe-say: messages programs send in Zoe's name, delivered and logged by the service |
+| `tasks.py` | tasks programs hand to Zoe with `zoe-say --task`: a turn of hers, or a note for the mind at work on the same thing |
+| `linking.py` | a program's notice read with the person's chats and minds before it goes: joining the conversation or work it belongs to, or kept back when it only reports Zoe's own work |
 | `launcher.py` | restarts on request and rolls back a version that fails to start |
 | `notices.py` | messages for the owners delivered at the next start |
 | `app.py` | wiring and lifecycle |

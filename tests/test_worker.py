@@ -7,9 +7,10 @@ import sys
 import tempfile
 import threading
 import time
-from contextlib import closing
+from contextlib import closing, contextmanager
 from datetime import datetime, timedelta
 from pathlib import Path
+from types import SimpleNamespace
 from zoneinfo import ZoneInfo
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
@@ -17,7 +18,10 @@ sys.path.insert(0, str(Path(__file__).resolve().parent))
 
 from fakes import FAKE_FAILURE, OTHER_OWNER_ACCOUNTS, OWNER, button_data, logged, message, press, worker_setup
 from test_runner import _claude
-from zoe import access, app, availability, claude_runner, formatting, i18n, minds, planner, prompt, say, store, vault
+from zoe import (
+    access, app, availability, claude_runner, formatting, i18n, minds, planner, prompt, say, store, strength,
+    vault,
+)
 from zoe import worker as worker_module
 from zoe.brain import Brain, Recalled
 from zoe.claude_runner import ClaudeRunner, Result, Step
@@ -87,6 +91,46 @@ def test_the_memories_a_reply_used_are_wired_closer_and_the_rest_drift_away():
         assert rain in weight and weight[garden] < 0.3
         episode = brain.top("episode")[0].id
         assert {t for t, *_ in brain._neighbors(episode)} == {umbrella, rain}
+
+
+class MergesWhatItWasShown:
+    """A turn that merges a memory it was shown into another, as a review it applies does; its reply
+    still names the merged one among those it used, and starts a parallel mind."""
+
+    def __init__(self, brain: Brain, kept: int, gone: int, other: int) -> None:
+        self.brain, self.kept, self.gone, self.other, self.prompts = brain, kept, gone, other, []
+
+    def run(self, prompt_text, profile, on_step=None, cancel=None, interrupt=None, follow_for=0.0, model="", effort="") -> Result:
+        self.prompts.append(prompt_text)
+        key = re.search(r"Your key for this turn is (\w+)\.", prompt_text).group(1)
+        if len(self.prompts) == 1:
+            assert f"- {self.gone}: " in prompt_text and self.brain.merge(self.kept, self.gone)
+        return Result(True, f"Ci lavora una mente 🔀\n[[{key} used: {self.gone}, {self.other}]]\n"
+                            f"[[{key} mind: Ombrelli]]\nCerca un ombrello robusto.\n[[/mind]]", False, False, 0, 1.0)
+
+
+def test_a_reply_naming_a_memory_merged_during_its_turn_is_answered_once_and_starts_its_mind():
+    with tempfile.TemporaryDirectory() as tmp:
+        conn, owner, worker, _, api = worker_setup(Path(tmp), on_disk=True)
+        brain = Brain(conn, owner.id)
+        umbrella = brain.add("fact", "Alex dimentica sempre l'ombrello quando piove")
+        rain = brain.add("preference", "Alex vuole sapere se piove prima di uscire")
+        same = brain.add("fact", "Alex esce senza ombrello anche con la pioggia")
+        worker._runner = runner = MergesWhatItWasShown(brain, same, umbrella, rain)
+        store.record_inbound(conn, message(5, OWNER, "Oggi piove, esco?"), owner.id)
+        # As the worker's loop runs its turns: one that breaks is recovered, and may be tried again.
+        while (claimed := store.claim_next(conn)) is not None:
+            try:
+                worker._handle(conn, claimed)
+            except Exception:
+                worker._recover(conn, claimed)
+        assert len(runner.prompts) == 1 and api.to(OWNER) == ["Ci lavora una mente 🔀"], api.to(OWNER)
+        assert tuple(conn.execute("SELECT state, attempts FROM messages WHERE direction = 'in'").fetchone()) == ("answered", 1)
+        assert [tuple(row) for row in conn.execute("SELECT title, state FROM minds")] == [("Ombrelli", "queued")]
+        assert brain.get(umbrella) is None and rain in {t for t, *_ in brain._neighbors(same)}
+        episode = brain.top("episode")[0].id
+        assert {same, rain} <= {t for t, *_ in brain._neighbors(episode)}
+        conn.close()
 
 
 def test_a_short_message_recalls_what_the_messages_before_it_were_about():
@@ -191,7 +235,7 @@ class LoggedOut:
     def __init__(self, failing: int) -> None:
         self.failing, self.runs = failing, 0
 
-    def run(self, prompt_text, profile, on_step=None, cancel=None, interrupt=None, follow_for=0.0) -> Result:
+    def run(self, prompt_text, profile, on_step=None, cancel=None, interrupt=None, follow_for=0.0, model="", effort="") -> Result:
         self.runs += 1
         if self.runs <= self.failing:
             return Result(False, "", False, False, 1, 0.1, failure="Not logged in · Please run /login")
@@ -221,7 +265,7 @@ def test_while_claude_cannot_work_turns_wait_and_the_owner_hears_it_once_and_whe
 class BrokenTurn:
     """Claude fails this turn with an error that does not stop every turn."""
 
-    def run(self, prompt_text, profile, on_step=None, cancel=None, interrupt=None, follow_for=0.0) -> Result:
+    def run(self, prompt_text, profile, on_step=None, cancel=None, interrupt=None, follow_for=0.0, model="", effort="") -> Result:
         return Result(False, "", False, False, 1, 0.1, failure=FAKE_FAILURE, error_code="server_error")
 
 
@@ -242,14 +286,32 @@ LIMIT = "You've hit your session limit · resets 6pm (Europe/Rome)"
 
 
 class OutOfUsage:
-    """Claude has reached the plan's session limit, which resets two hours from now."""
+    """Claude has reached the plan's session limit, which resets two hours from ``now``."""
 
-    def __init__(self) -> None:
-        reset = datetime.now().astimezone() + timedelta(hours=2)
+    def __init__(self, now: datetime | None = None) -> None:
+        reset = (now or datetime.now().astimezone()) + timedelta(hours=2)
         self.limit = f"You've hit your session limit · resets {reset:%I:%M%p}"
 
-    def run(self, prompt_text, profile, on_step=None, cancel=None, interrupt=None, follow_for=0.0) -> Result:
+    def run(self, prompt_text, profile, on_step=None, cancel=None, interrupt=None, follow_for=0.0, model="", effort="") -> Result:
         return Result(False, self.limit, False, False, 1, 0.1, session_id="s-1", failure=self.limit)
+
+
+@contextmanager
+def _at(now: datetime):
+    """Holds the clock that tells whether Claude can work at ``now``, so a notice reads the same
+    whatever the hour the checks run at."""
+
+    class Held(datetime):
+        @classmethod
+        def now(cls, tz=None):
+            return now.astimezone(tz) if tz else now
+
+    real = availability.datetime, availability.time
+    availability.datetime, availability.time = Held, SimpleNamespace(time=now.timestamp)
+    try:
+        yield
+    finally:
+        availability.datetime, availability.time = real
 
 
 def test_a_usage_limit_holds_the_turns_until_it_resets_and_says_when_once():
@@ -263,26 +325,29 @@ def test_a_usage_limit_holds_the_turns_until_it_resets_and_says_when_once():
     assert availability.resumes_at(night, afternoon) == datetime(2026, 10, 23, 3, 0, tzinfo=rome).timestamp()
     assert availability.resumes_at("Not logged in · Please run /login", afternoon) is None
 
-    with tempfile.TemporaryDirectory() as tmp:
-        conn, owner, worker, _, api = worker_setup(Path(tmp))
-        worker._runner = limited = OutOfUsage()
-        store.record_inbound(conn, message(5, OWNER, "guarda le icone"), owner.id)
-        store.record_inbound(conn, message(6, OWNER, "e questa?"), owner.id)
-        msg = store.claim_next(conn)
-        worker._handle(conn, msg)
-        row = conn.execute("SELECT state, attempts FROM messages WHERE id = ?", (msg.id,)).fetchone()
-        assert (row["state"], row["attempts"]) == ("received", 0)
-        assert availability.waiting(conn)
-        resume = availability.resumes_at(limited.limit)
-        assert float(store.get_state(conn, "claude_retry_at")) == resume and resume > time.time() + 7000
-        again = store.claim_next(conn)
-        assert again.id == msg.id and again.attempts == 1
-        worker._handle(conn, again)
-        say.deliver(conn, api)
-        told = [t for t in api.to(OWNER) if "limite" in t]
-        assert len(told) == 1 and f"riprendo alle <b>{datetime.fromtimestamp(resume):%H:%M}" in told[0]
-        assert not any("non ho potuto" in t.lower() or "Claude non può lavorare" in t for t in api.to(OWNER))
-        assert conn.execute("SELECT COUNT(*) FROM messages WHERE state = 'failed'").fetchone()[0] == 0
+    # A reset later the same day is told by its time, one past midnight with its date too.
+    for now, moment in ((datetime(2026, 10, 22, 17, 31), "19:31"), (datetime(2026, 10, 22, 22, 31), "23/10 00:31")):
+        with _at(now), tempfile.TemporaryDirectory() as tmp:
+            conn, owner, worker, _, api = worker_setup(Path(tmp))
+            worker._runner = limited = OutOfUsage(now)
+            store.record_inbound(conn, message(5, OWNER, "guarda le icone"), owner.id)
+            store.record_inbound(conn, message(6, OWNER, "e questa?"), owner.id)
+            msg = store.claim_next(conn)
+            worker._handle(conn, msg)
+            row = conn.execute("SELECT state, attempts FROM messages WHERE id = ?", (msg.id,)).fetchone()
+            assert (row["state"], row["attempts"]) == ("received", 0)
+            assert availability.waiting(conn)
+            resume = availability.resumes_at(limited.limit)
+            assert float(store.get_state(conn, "claude_retry_at")) == resume == (now + timedelta(hours=2)).timestamp()
+            again = store.claim_next(conn)
+            assert again.id == msg.id and again.attempts == 1
+            worker._handle(conn, again)
+            say.deliver(conn, api)
+            told = [t for t in api.to(OWNER) if "limite" in t]
+            assert len(told) == 1 and f"riprendo alle <b>{moment}</b>" in told[0], told
+            assert not any("non ho potuto" in t.lower() or "Claude non può lavorare" in t for t in api.to(OWNER))
+            assert conn.execute("SELECT COUNT(*) FROM messages WHERE state = 'failed'").fetchone()[0] == 0
+            conn.close()
 
 
 def test_notices_about_zoe_herself_reach_only_the_owners_main_chat():
@@ -376,7 +441,7 @@ class WritesDuringTheTurn:
         self.conn, self.person_id = conn, person_id
         self.prompts, self.profiles = [], []
 
-    def run(self, prompt_text, profile, on_step=None, cancel=None, interrupt=None, follow_for=0.0) -> Result:
+    def run(self, prompt_text, profile, on_step=None, cancel=None, interrupt=None, follow_for=0.0, model="", effort="") -> Result:
         self.prompts.append(prompt_text)
         self.profiles.append(profile)
         if len(self.prompts) == 1:
@@ -412,7 +477,7 @@ class WritesDuringOwnWork:
         self.wrote, self.reply, self.session = wrote, reply, session
         self.prompts, self.profiles, self.shown = [], [], None
 
-    def run(self, prompt_text, profile, on_step=None, cancel=None, interrupt=None, follow_for=0.0) -> Result:
+    def run(self, prompt_text, profile, on_step=None, cancel=None, interrupt=None, follow_for=0.0, model="", effort="") -> Result:
         self.prompts.append(prompt_text)
         self.profiles.append(profile)
         if len(self.prompts) == 1:
@@ -519,7 +584,7 @@ class QuotesDuringTheTurn:
         self.conn, self.person_id, self.video = conn, person_id, video
         self.prompts, self.sent = [], None
 
-    def run(self, prompt_text, profile, on_step=None, cancel=None, interrupt=None, follow_for=0.0) -> Result:
+    def run(self, prompt_text, profile, on_step=None, cancel=None, interrupt=None, follow_for=0.0, model="", effort="") -> Result:
         self.prompts.append(prompt_text)
         if len(self.prompts) == 1:
             key = re.search(r"Your key for this turn is (\w+)\.", prompt_text).group(1)
@@ -558,7 +623,7 @@ class StuckThenDone:
     def __init__(self) -> None:
         self.prompts, self.profiles = [], []
 
-    def run(self, prompt_text, profile, on_step=None, cancel=None, interrupt=None, follow_for=0.0) -> Result:
+    def run(self, prompt_text, profile, on_step=None, cancel=None, interrupt=None, follow_for=0.0, model="", effort="") -> Result:
         self.prompts.append(prompt_text)
         self.profiles.append(profile)
         if len(self.prompts) == 1:
@@ -584,7 +649,7 @@ class StuckThenSends:
     def __init__(self, video: Path) -> None:
         self.video, self.prompts = video, []
 
-    def run(self, prompt_text, profile, on_step=None, cancel=None, interrupt=None, follow_for=0.0) -> Result:
+    def run(self, prompt_text, profile, on_step=None, cancel=None, interrupt=None, follow_for=0.0, model="", effort="") -> Result:
         self.prompts.append(prompt_text)
         if len(self.prompts) == 1:
             self.key = re.search(r"Your key for this turn is (\w+)\.", prompt_text).group(1)
@@ -636,6 +701,47 @@ def test_a_reply_that_could_not_be_delivered_is_delivered_again_without_a_new_tu
         assert len(runner.prompts) == 1 and api.to(OWNER)[-1] == "Prenotato 🍝"
 
 
+def test_a_step_that_breaks_after_the_reply_is_delivered_holds_back_neither_the_others_nor_the_turn():
+    with tempfile.TemporaryDirectory() as tmp:
+        conn, owner, worker, runner, api = worker_setup(
+            Path(tmp), "Ci penso io 🔀\n[[{k} plan: 2031-05-01 09:00 | Controlla il sito]]\n"
+                       "[[{k} mind: Sito]]\nCrea il sito del forno.\n[[/mind]]", on_disk=True)
+
+        def breaks(*args: object) -> None:
+            raise RuntimeError("the disk is full")
+
+        reinforce = Brain.reinforce
+        Brain.reinforce, worker._plan = breaks, breaks
+        store.record_inbound(conn, message(5, OWNER, "Fammi il sito del forno"), owner.id)
+        try:
+            with logged("zoe.worker") as lines:
+                # As the worker's loop runs its turns: one that breaks is recovered, and may be tried again.
+                while (claimed := store.claim_next(conn)) is not None:
+                    turn = claimed
+                    try:
+                        worker._handle(conn, turn)
+                    except Exception:
+                        worker._recover(conn, turn)
+        finally:
+            Brain.reinforce = reinforce
+        assert len(runner.prompts) == 1 and api.to(OWNER) == ["Ci penso io 🔀"], api.to(OWNER)
+        assert [line for line in lines if "is answered, but" in line] == [
+            "message 1 is answered, but learning from the memories it used broke",
+            "message 1 is answered, but its plans broke"], lines
+        assert [tuple(row) for row in conn.execute("SELECT title, state FROM minds")] == [("Sito", "queued")]
+        assert len(Brain(conn, owner.id).top("episode")) == 1 and not conn.execute("SELECT 1 FROM plans").fetchall()
+
+        def answered_once() -> bool:
+            row = conn.execute("SELECT state, attempts FROM messages WHERE direction = 'in'").fetchone()
+            return tuple(row) == ("answered", 1) and store.claim_next(conn) is None and not api.notices
+
+        assert answered_once()
+        # Whatever else breaks once the reply is delivered, recovering the turn leaves it answered.
+        worker._recover(conn, turn)
+        assert answered_once() and api.to(OWNER) == ["Ci penso io 🔀"]
+        conn.close()
+
+
 class AnswersThenWaits:
     """A turn that answers while its background wait runs and speaks again when the wait ends;
     any later turn answers plainly."""
@@ -645,7 +751,7 @@ class AnswersThenWaits:
         self.profiles: list = []
 
     def run(self, prompt_text: str, profile, on_step: object = None, cancel: object = None,
-            interrupt: object = None, follow_for: float = 0.0) -> Result:
+            interrupt: object = None, follow_for: float = 0.0, model: str = "", effort: str = "") -> Result:
         self.profiles.append(profile)
         if len(self.profiles) > 1:
             return Result(True, "Sì, il pane è in forno", False, False, 0, 1.0, session_id="s-4")
@@ -662,11 +768,16 @@ class AnswersThenWaits:
                       session_id="s-3", later=Later())
 
 
-def _done(conn) -> None:
-    """Let the threads that follow background work end, then close the chat's database."""
+def _followed() -> None:
+    """Let the threads that follow background work end."""
     for follower in threading.enumerate():
         if "-later-" in follower.name:
             follower.join(5)
+
+
+def _done(conn) -> None:
+    """Let the threads that follow background work end, then close the chat's database."""
+    _followed()
     conn.close()
 
 
@@ -708,6 +819,21 @@ def test_a_turn_is_told_to_finish_short_work_and_to_announce_long_work_in_one_li
         assert "never repeat in a result what an earlier update already told the person" in told
 
 
+def test_a_turn_is_told_to_do_a_touch_up_itself_with_the_checks_that_exist():
+    with tempfile.TemporaryDirectory() as tmp:
+        conn, owner, worker, runner, _ = worker_setup(Path(tmp), "Fatto")
+        _say(conn, worker, owner, 5, "centra il titolo della locandina")
+        told = " ".join(runner.prompts[-1].split())
+        assert "A touch-up the person sees at once and one command undoes" in told, told
+        assert "you do in this turn, without a parallel mind" in told, told
+        assert "run the checks that already exist, write no new tests, and say what you did not try" in told, told
+        assert f"Full tests are for where a mistake costs: {strength.COSTLY}." in told, told
+        # A change to Zoe herself is never done this way: the pipeline and its tests stay the only road.
+        assert ("Your own code and skills are never such a touch-up: they change only through your pipeline, with "
+                "its tests.") in told, told
+        assert "your self-improvement skill changes your own code or skills through your pipeline" in told, told
+
+
 def test_what_a_wait_ends_with_takes_the_place_of_its_notice():
     with tempfile.TemporaryDirectory() as tmp:
         conn, owner, worker, _, api = worker_setup(Path(tmp), on_disk=True)
@@ -720,7 +846,7 @@ def test_what_a_wait_ends_with_takes_the_place_of_its_notice():
                 yield Result(True, "Render pronto: <b>video.mp4</b>, anteprima inclusa", False, False, 0, 3.0)
 
         class StartsARender:
-            def run(self, prompt_text, profile, on_step=None, cancel=None, interrupt=None, follow_for=0.0):
+            def run(self, prompt_text, profile, on_step=None, cancel=None, interrupt=None, follow_for=0.0, model="", effort=""):
                 return Result(True, "Avvio il render, circa 20 min", False, False, None, 1.0, session_id="s-6",
                               later=Later())
 
@@ -735,6 +861,180 @@ def test_what_a_wait_ends_with_takes_the_place_of_its_notice():
         assert not api.deleted
 
 
+class WaitsThenWakes:
+    """Claude for a turn that answers ``first`` while its wait runs, in session s-1, and is woken once for each of
+    ``woken`` when the wait ends. Later turns answer ``plain``, and a copy of a woken session answers what ``copy``
+    makes of the prompt telling it what it missed. Directives are written with {k}, the first turn's key."""
+
+    def __init__(self, first: str, woken: list[str], plain: str = "", copy=lambda told: "?") -> None:
+        self.ended = threading.Event()
+        self.first, self.woken, self.plain, self.copy = first, woken, plain, copy
+        self.prompts: list[str] = []
+        self.profiles: list = []
+        self.key = ""
+
+    def run(self, prompt_text, profile, on_step=None, cancel=None, interrupt=None, follow_for=0.0, model="", effort=""):
+        self.prompts.append(prompt_text)
+        self.profiles.append(profile)
+        if "--fork-session" in profile.args:
+            return Result(True, self.copy(prompt_text).replace("{k}", self.key), False, False, 0, 1.0,
+                          session_id=f"copy-{len(self.prompts)}")
+        if self.key:
+            return Result(True, self.plain, False, False, 0, 1.0, session_id=f"s-{len(self.prompts)}")
+        self.key = re.search(r"Your key for this turn is (\w+)\.", prompt_text).group(1)
+        runner = self
+
+        class Later:
+            def answers(self, cancel=None):
+                runner.ended.wait(5)
+                for text in runner.woken:
+                    yield Result(True, text.replace("{k}", runner.key), False, False, 0, 9.0, session_id="s-1")
+
+        return Result(True, self.first.replace("{k}", self.key), False, False, None, 1.0, session_id="s-1",
+                      later=Later())
+
+    def copies(self) -> list[tuple[str, tuple]]:
+        """The prompt and the arguments of each run of a copy of a woken session."""
+        return [(text, profile.args) for text, profile in zip(self.prompts, self.profiles)
+                if "--fork-session" in profile.args]
+
+
+FOLDER = "\n[[{k} options: Sì, preparala | No, non serve]]"
+
+
+def _shown(api) -> list[str]:
+    """What the owner's chat shows: each message as it reads now, the deleted ones gone."""
+    gone = {number for chat, number in api.deleted if chat == OWNER}
+    return [api.edited.get(number, text) for (chat, text, _), number in zip(api.sent, api.sent_ids)
+            if chat == OWNER and number not in gone]
+
+
+def _choice_on(conn, telegram_id: int) -> tuple[int, str]:
+    """The latest question with buttons on that message: its id and its options."""
+    row = conn.execute("SELECT id, options FROM choices WHERE telegram_id = ? ORDER BY id DESC LIMIT 1",
+                       (telegram_id,)).fetchone()
+    return row["id"], row["options"]
+
+
+def test_a_wait_that_a_later_turn_closed_sends_nothing_when_it_ends():
+    with tempfile.TemporaryDirectory() as tmp:
+        conn, owner, worker, _, api = worker_setup(Path(tmp), on_disk=True)
+        summary = "Mia è configurata, manca la foto: la salvo appena la carichi. Ti preparo la cartella?"
+        done = "La foto di Mia è salvata e ho fermato il controllo, non serve più."
+        worker._runner = runner = WaitsThenWakes(
+            summary + FOLDER,
+            # The wait is stopped by the later turn, the session starts it again, and both ends wake it.
+            [summary + FOLDER, "Mia è configurata tutta e ho salvato la foto. Ti preparo la cartella?" + FOLDER],
+            plain=done,
+            copy=lambda told: "[[{k} skip: il turno dopo ha già salvato la foto]]" if done in told else "?",
+        )
+        store.record_inbound(conn, message(5, OWNER, "configura Mia"), owner.id)
+        worker._handle(conn, store.claim_next(conn))
+        notice = api.sent_ids[-1]
+        assert api.to(OWNER) == [summary] and len(button_data([e for e in api.edits if e[1] == notice][-1][3])) == 2
+        told = " ".join(runner.prompts[0].split())
+        assert "If the chat went on after your last message, you are shown what it said before anything goes out" \
+            in told, told
+        assert f"reply only with [[{runner.key} skip: the reason]]: nothing is sent" in told, told
+
+        _say(conn, worker, owner, 6, "ora ho caricato la foto")
+        runner.ended.set()
+        _followed()
+        assert api.to(OWNER) == [summary, done], "one message for the work: nothing new, nothing rewritten"
+        assert not api.deleted and not [e for e in api.edits if e[1] == notice and "tutta" in (e[2] or "")]
+        copies = runner.copies()
+        assert len(copies) == 2, "every woken answer is first written again by a copy told what it missed"
+        for text, args in copies:
+            assert args[-3:] == ("--resume", "s-1", "--fork-session")
+            assert "Alex: ora ho caricato la foto" in text and f"You: {done}" in text and f"(#{notice})" in text
+        assert not any("--resume" in p.args and "--fork-session" not in p.args for p in runner.profiles)
+        episodes = [r.content for r in Brain(conn, owner.id).top("episode")]
+        assert sum("[sent nothing: il turno dopo ha già salvato la foto]" in e for e in episodes) == 2
+        conn.close()
+
+
+def test_a_woken_answer_with_options_is_edited_in_place_with_its_buttons():
+    with tempfile.TemporaryDirectory() as tmp:
+        conn, owner, worker, _, api = worker_setup(Path(tmp), on_disk=True)
+        worker._runner = runner = WaitsThenWakes(
+            "Avvio il render, circa 20 min",
+            ["Render pronto: <b>video.mp4</b>. Ti preparo la cartella?" + FOLDER,
+             "Render pronto: <b>video.mp4</b>, anteprima inclusa. Ti preparo la cartella?" + FOLDER])
+        store.record_inbound(conn, message(5, OWNER, "fai il render"), owner.id)
+        worker._handle(conn, store.claim_next(conn))
+        notice = api.sent_ids[-1]
+        runner.ended.set()
+        _followed()
+        final = "Render pronto: <b>video.mp4</b>, anteprima inclusa. Ti preparo la cartella?"
+        assert api.to(OWNER) == [final] and not api.deleted
+        edits = [e for e in api.edits if (e[2] or "").startswith("Render pronto")]
+        assert [e[1] for e in edits] == [notice, notice]
+        choice, options = _choice_on(conn, notice)
+        assert button_data(edits[-1][3]) == [f"c:{choice}:0", f"c:{choice}:1"] and "No, non serve" in options
+        assert store.find_message(conn, OWNER, notice)["text"] == f"{final}\n[options: Sì, preparala | No, non serve]"
+        assert not runner.copies(), "a chat that did not go on needs no copy"
+        conn.close()
+
+
+def test_a_woken_answer_the_chat_went_on_from_is_written_again_and_replaces_its_buried_notice():
+    with tempfile.TemporaryDirectory() as tmp:
+        conn, owner, worker, _, api = worker_setup(Path(tmp), on_disk=True)
+        again = "Render pronto e sì, il titolo l'ho già messo. Ti preparo la cartella?"
+        worker._runner = runner = WaitsThenWakes(
+            "Avvio il render, circa 20 min", ["Render pronto. Ti preparo la cartella?" + FOLDER],
+            plain="Sì, il titolo c'è", copy=lambda told: again + FOLDER if "hai messo il titolo?" in told else "?")
+        store.record_inbound(conn, message(5, OWNER, "fai il render"), owner.id)
+        worker._handle(conn, store.claim_next(conn))
+        notice = api.sent_ids[-1]
+        _say(conn, worker, owner, 6, "hai messo il titolo?")
+        runner.ended.set()
+        _followed()
+        assert api.deleted == [(OWNER, notice)], "the buried notice leaves its place to the answer below"
+        assert api.to(OWNER) == ["Avvio il render, circa 20 min", "Sì, il titolo c'è", again]
+        choice, _ = _choice_on(conn, api.sent_ids[-1])
+        assert button_data(api.last_buttons_to(OWNER)) == [f"c:{choice}:0", f"c:{choice}:1"]
+        conn.close()
+
+
+class TwoWaits:
+    """Two turns, each answering while a wait for the same bread runs in a session of its own, both woken when
+    it ends. A copy of a woken session takes a moment, in which the other wait may speak, and sends nothing
+    when the chat it is shown already says the bread is ready."""
+
+    def __init__(self) -> None:
+        self.ended = threading.Event()
+        self.turns = 0
+
+    def run(self, prompt_text, profile, on_step=None, cancel=None, interrupt=None, follow_for=0.0, model="", effort=""):
+        if "--fork-session" in profile.args:
+            time.sleep(0.3)
+            key = re.search(r"reply only with \[\[(\w+) skip", prompt_text).group(1)
+            ready = "Il pane è pronto" in prompt_text
+            return Result(True, f"[[{key} skip: già detto]]" if ready else "Il pane è pronto 🍞", False, False, 0, 1.0)
+        self.turns += 1
+        session, ended = f"s-{self.turns}", self.ended
+
+        class Later:
+            def answers(self, cancel=None):
+                ended.wait(5)
+                yield Result(True, "Il pane è pronto 🍞", False, False, 0, 9.0, session_id=session)
+
+        return Result(True, ["Lo metto in forno", "Lo controllo io"][self.turns - 1], False, False, None, 1.0,
+                      session_id=session, later=Later())
+
+
+def test_waits_that_end_together_give_one_answer():
+    with tempfile.TemporaryDirectory() as tmp:
+        conn, owner, worker, _, api = worker_setup(Path(tmp), on_disk=True)
+        worker._runner = runner = TwoWaits()
+        _say(conn, worker, owner, 5, "metti il pane in forno")
+        _say(conn, worker, owner, 6, "e dimmi quando è pronto")
+        runner.ended.set()
+        _followed()
+        assert len(_shown(api)) == 2 and _shown(api).count("Il pane è pronto 🍞") == 1, _shown(api)
+        conn.close()
+
+
 def test_background_work_stopped_before_it_ends_is_told_to_the_person():
     with tempfile.TemporaryDirectory() as tmp:
         conn, owner, worker, _, api = worker_setup(Path(tmp), on_disk=True)
@@ -744,7 +1044,7 @@ def test_background_work_stopped_before_it_ends_is_told_to_the_person():
                 yield Result(False, "", True, False, None, 14400.0)
 
         class StartsAWait:
-            def run(self, prompt_text, profile, on_step=None, cancel=None, interrupt=None, follow_for=0.0):
+            def run(self, prompt_text, profile, on_step=None, cancel=None, interrupt=None, follow_for=0.0, model="", effort=""):
                 return Result(True, "Avvio il download", False, False, None, 1.0, session_id="s-5", later=Later())
 
         worker._runner = StartsAWait()

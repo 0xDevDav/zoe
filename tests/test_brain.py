@@ -143,6 +143,29 @@ def test_what_a_reply_used_wires_together_and_what_came_up_for_nothing_drifts_aw
     assert {t: w for t, w, _ in brain._neighbors(a)} == weights
 
 
+def test_what_names_a_neuron_merged_or_forgotten_meanwhile_follows_the_one_that_kept_it_or_skips_it():
+    with tempfile.TemporaryDirectory() as tmp:
+        conn, alex = _on_disk(Path(tmp))
+        brain = Brain(conn, alex.id)
+        tea, green, cup = brain.add("preference", "Ama il tè"), brain.add("preference", "Beve tè verde"), brain.add("term", "Tazza")
+        market, noise = brain.add("fact", "Compra il tè al mercato"), brain.add("fact", "Il mercato è il sabato")
+        brain.connect(tea, noise, delta=0.5)
+        assert brain.merge(tea, green) and brain.forget(market)
+        assert brain.current([green, cup, market, tea, cup, 999]) == [tea, cup]
+        brain.reinforce([green, cup, market], [noise, market, green])
+        weights = {t: w for t, w, _ in brain._neighbors(tea)}
+        assert set(weights) == {noise, cup} and weights[noise] < 0.5, weights
+        assert conn.execute("SELECT fire_count FROM neurons WHERE id = ?", (tea,)).fetchone()[0] == 1
+        episode = brain.learn("episode", "Una chiacchierata sul tè", related=[green, market, tea])
+        assert {t: round(w, 2) for t, w, _ in brain._neighbors(episode)} == {tea: 0.15}
+        brain.connect(green, tea)
+        brain.connect(market, cup)
+        brain.fire([market, 999])
+        assert {t for t, *_ in brain._neighbors(cup)} == {tea} and tea not in {t for t, *_ in brain._neighbors(tea)}
+        assert conn.execute("PRAGMA foreign_key_check").fetchall() == []
+        conn.close()
+
+
 def test_a_neuron_wired_to_everything_is_not_recalled_for_everything():
     brain = _brain()
     hub = brain.add("feedback", "answer once")

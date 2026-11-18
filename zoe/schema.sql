@@ -188,7 +188,8 @@ CREATE TABLE IF NOT EXISTS files (
 CREATE INDEX IF NOT EXISTS idx_files_expiry ON files(expires_at);
 
 -- Long work Zoe handed to a parallel mind. session_id lets a stopped run resume
--- where it was; notes hold what the person added while it worked.
+-- where it was; notes hold what the person added while it worked; reminded_at is
+-- when it was asked, once, for news of work it had saved without telling.
 CREATE TABLE IF NOT EXISTS minds (
     id          INTEGER PRIMARY KEY AUTOINCREMENT,
     neuron_id   INTEGER REFERENCES neurons(id) ON DELETE SET NULL,
@@ -210,7 +211,10 @@ CREATE TABLE IF NOT EXISTS minds (
     attempts    INTEGER NOT NULL DEFAULT 0,
     started_at  REAL,
     finished_at REAL,
-    created_at  REAL NOT NULL
+    created_at  REAL NOT NULL,
+    reminded_at REAL,
+    -- What the mind took on from the tasks of programs (tasks.py): a JSON list of keys.
+    task_keys   TEXT
 );
 CREATE INDEX IF NOT EXISTS idx_minds_state ON minds(state, id);
 
@@ -263,3 +267,99 @@ CREATE TABLE IF NOT EXISTS approvals (
     answered_at REAL
 );
 CREATE INDEX IF NOT EXISTS idx_approvals_state ON approvals(state, id);
+
+-- Which Claude model and effort each turn, mind and study ran on, why, and how it ended
+-- (strength.py). The columns from needed on are left empty.
+CREATE TABLE IF NOT EXISTS model_choices (
+    id          INTEGER PRIMARY KEY AUTOINCREMENT,
+    source      TEXT NOT NULL CHECK (source IN ('chat', 'mind', 'study')),
+    chat_id     INTEGER,
+    message_id  INTEGER,
+    mind_id     INTEGER,
+    category    TEXT NOT NULL,
+    level       INTEGER NOT NULL,
+    model       TEXT NOT NULL,
+    effort      TEXT NOT NULL,
+    reason      TEXT NOT NULL,
+    explicit    INTEGER NOT NULL DEFAULT 0,
+    outcome     TEXT NOT NULL DEFAULT '',
+    duration    REAL,
+    created_at  REAL NOT NULL,
+    needed      INTEGER,
+    judge       TEXT NOT NULL DEFAULT '',
+    judge_level INTEGER,
+    judge_reason TEXT NOT NULL DEFAULT '',
+    judge_seconds REAL,
+    rules_level INTEGER
+);
+CREATE INDEX IF NOT EXISTS idx_model_choices_chat ON model_choices(source, chat_id, id);
+CREATE INDEX IF NOT EXISTS idx_model_choices_category ON model_choices(category, created_at);
+
+-- An owner's finished work, a chat turn or a parallel mind, by its Claude session (lessons.py): its
+-- transcript is read up to ``lines`` for the guides it used and the tools it ran, and again from there
+-- when the session goes on and finishes anew. Work that ran enough tools waits for a lesson review
+-- until ``reviewed_at``.
+CREATE TABLE IF NOT EXISTS finished_work (
+    id          INTEGER PRIMARY KEY AUTOINCREMENT,
+    source      TEXT NOT NULL CHECK (source IN ('chat', 'mind')),
+    session_id  TEXT NOT NULL UNIQUE,
+    lines       INTEGER NOT NULL DEFAULT 0,
+    read_at     REAL,
+    created_at  REAL NOT NULL,
+    tools       INTEGER,
+    reviewed_at REAL
+);
+CREATE INDEX IF NOT EXISTS idx_finished_work_read ON finished_work(read_at, id);
+
+-- A guide (a Markdown file of the workdir, as the workdir names it) that a finished work read, and when
+-- the work finished.
+CREATE TABLE IF NOT EXISTS guide_reads (
+    id          INTEGER PRIMARY KEY AUTOINCREMENT,
+    guide       TEXT NOT NULL,
+    read_at     REAL NOT NULL
+);
+CREATE INDEX IF NOT EXISTS idx_guide_reads_guide ON guide_reads(guide, read_at);
+
+-- What a lesson review kept in the guides: one commit of the workdir each, which the owner may revert.
+CREATE TABLE IF NOT EXISTS lessons (
+    id          INTEGER PRIMARY KEY AUTOINCREMENT,
+    title       TEXT NOT NULL,
+    what        TEXT NOT NULL DEFAULT '',
+    files       TEXT NOT NULL,
+    sha         TEXT NOT NULL,
+    state       TEXT NOT NULL DEFAULT 'kept' CHECK (state IN ('kept', 'undone')),
+    created_at  REAL NOT NULL,
+    undone_at   REAL
+);
+CREATE INDEX IF NOT EXISTS idx_lessons_created ON lessons(created_at);
+
+-- Conversations with the other AI agents of this machine (peers.py): the code both sides name one
+-- by, the peer, what it is about, the turns it took, and whether it is closed.
+CREATE TABLE IF NOT EXISTS peer_threads (
+    id         INTEGER PRIMARY KEY AUTOINCREMENT,
+    code       TEXT NOT NULL UNIQUE,
+    peer       TEXT NOT NULL,
+    subject    TEXT NOT NULL DEFAULT '',
+    turns      INTEGER NOT NULL DEFAULT 0,
+    state      TEXT NOT NULL DEFAULT 'open' CHECK (state IN ('open', 'closed')),
+    created_at REAL NOT NULL,
+    updated_at REAL NOT NULL
+);
+CREATE INDEX IF NOT EXISTS idx_peer_threads_peer ON peer_threads(peer, created_at);
+
+-- Every message of those conversations, in both directions, kept for good. A message that
+-- starts a turn waits for its answer, which points back to it (answers); msg_id is the
+-- sender's own id, the same on a retry, so a message is kept and answered once.
+CREATE TABLE IF NOT EXISTS peer_messages (
+    id         INTEGER PRIMARY KEY AUTOINCREMENT,
+    thread_id  INTEGER NOT NULL REFERENCES peer_threads(id),
+    msg_id     TEXT NOT NULL UNIQUE,
+    sender     TEXT NOT NULL,
+    answers    INTEGER REFERENCES peer_messages(id),
+    text       TEXT NOT NULL,
+    ends       INTEGER NOT NULL DEFAULT 0,
+    state      TEXT NOT NULL DEFAULT 'done' CHECK (state IN ('waiting', 'done', 'failed')),
+    created_at REAL NOT NULL
+);
+CREATE INDEX IF NOT EXISTS idx_peer_messages_thread ON peer_messages(thread_id, id);
+CREATE INDEX IF NOT EXISTS idx_peer_messages_time ON peer_messages(created_at);

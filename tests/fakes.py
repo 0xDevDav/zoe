@@ -48,11 +48,13 @@ class FakeRunner:
         self.replies = list(replies)
         self.prompts: list[str] = []
         self.profiles: list[object] = []
+        self.models: list[tuple[str, str]] = []
 
     def run(self, prompt_text: str, profile: object, on_step: object = None, cancel: object = None,
-            interrupt: object = None, follow_for: float = 0.0) -> Result:
+            interrupt: object = None, follow_for: float = 0.0, model: str = "", effort: str = "") -> Result:
         self.prompts.append(prompt_text)
         self.profiles.append(profile)
+        self.models.append((model, effort))
         reply = self.replies.pop(0)
         key = re.search(r"Your key for this turn is (\w+)\.", prompt_text)
         if reply and key:
@@ -64,9 +66,9 @@ class FakeRunner:
 def worker_setup(
     home: Path, *replies: str | None, on_disk: bool = False, others: tuple[int, ...] = ()
 ) -> tuple[sqlite3.Connection, access.Person, Worker, FakeRunner, FakeAPI]:
-    """A database with one owner, and a worker whose Claude gives the prepared replies. The
-    owner writes from ``OWNER``, their main chat, and from the ``others`` accounts too. The
-    database lives in ``home`` when other threads must open it too."""
+    """A database with one owner, and a worker whose Claude gives the prepared replies. The owner writes
+    from ``OWNER``, their main chat, and from the ``others`` accounts too. The database lives in ``home``
+    when other threads must open it too."""
     if on_disk:
         conn = connect(home / "zoe.db")
     else:

@@ -18,6 +18,9 @@ from __future__ import annotations
 import html
 import re
 
+# The longest text Telegram takes in one message.
+MESSAGE_LIMIT = 4096
+
 _ALLOWED = {
     "b", "strong", "i", "em", "u", "ins", "s", "strike", "del",
     "code", "pre", "a", "blockquote", "tg-spoiler", "span",
@@ -245,7 +248,7 @@ def to_telegram(text: str) -> str:
     return text if _balanced(text) else _strip_tags(text)
 
 
-def split(text: str, limit: int = 4096) -> list[str]:
+def split(text: str, limit: int = MESSAGE_LIMIT) -> list[str]:
     """Split formatted text into messages under Telegram's length limit, at block boundaries."""
     chunks: list[str] = []
     current = ""
@@ -267,8 +270,13 @@ def split(text: str, limit: int = 4096) -> list[str]:
     return [c if _balanced(c) else _strip_tags(c) for c in chunks]
 
 
+def to_text(text: str) -> str:
+    """Return ``text`` as Telegram would show it, as plain text without markup."""
+    return html.unescape(_strip_tags(to_telegram(text)))
+
+
 def to_plain(text: str) -> str:
     """Return the words of ``text`` without markup or emoji, for speech."""
-    plain = html.unescape(_strip_tags(to_telegram(text)))
+    plain = to_text(text)
     plain = EMOJI.sub("", plain).replace("•", "")
     return "\n".join(" ".join(line.split()) for line in plain.splitlines()).strip()

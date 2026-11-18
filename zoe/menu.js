@@ -169,6 +169,16 @@ function block(part) {
     };
     return form;
   }
+  if ("chat" in part) {
+    // A conversation between agents, read only: each message a bubble on its sender's side.
+    const chat = el("div", "chat");
+    for (const line of part.chat) {
+      const bubble = el("div", ["bubble", line.side, line.tone].join(" ").trim());
+      bubble.append(el("small", "", line.at ? `${line.who} · ${line.at}` : line.who), el("div", "", line.text));
+      chat.append(bubble);
+    }
+    return chat;
+  }
   if ("quote" in part) {
     const details = el("details", "quote");
     const full = el("div", "", part.quote);

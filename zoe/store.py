@@ -163,9 +163,11 @@ def enqueue(
 
 
 _RETURNING = "RETURNING id, chat_id, person_id, telegram_id, text, kind, payload, attempts"
-_FOLLOWUP = (
-    "chat_id = ? AND direction = 'in' AND state = 'received' AND id > ? AND kind NOT IN ('plan', 'mind')"
-)
+# Zoe's own work queued in a chat: plans that came due, news of her parallel minds and tasks programs hand her
+# (``planner.PLAN``, ``minds.EVENT``, ``tasks.TASK``). None is a message of the person's.
+OWN_WORK = ("plan", "mind", "task")
+NOT_OWN_WORK = f"kind NOT IN ({', '.join(repr(kind) for kind in OWN_WORK)})"
+_FOLLOWUP = f"chat_id = ? AND direction = 'in' AND state = 'received' AND id > ? AND {NOT_OWN_WORK}"
 
 
 def _message(row: sqlite3.Row) -> Message:
@@ -232,8 +234,14 @@ def mark(conn: sqlite3.Connection, message_id: int, state: str) -> None:
     )
 
 
+def answered(conn: sqlite3.Connection, message_id: int) -> bool:
+    """Whether a message got its reply."""
+    row = conn.execute("SELECT state FROM messages WHERE id = ?", (message_id,)).fetchone()
+    return row is not None and row["state"] == "answered"
+
+
 def note(conn: sqlite3.Connection, message_id: int, key: str, value: object) -> None:
-    """Keep something about a message in its payload, for the next try of its turn."""
+    """Keep something about a message in its payload, such as what the next try of its turn needs."""
     conn.execute(
         "UPDATE messages SET payload = json_set(COALESCE(payload, '{}'), ?, json(?)), updated_at = ? WHERE id = ?",
         (f"$.{key}", json.dumps(value), time.time(), message_id),
@@ -316,13 +324,14 @@ def revise_outbound(conn: sqlite3.Connection, chat_id: int, telegram_id: int, te
 def find_message(conn: sqlite3.Connection, chat_id: int, telegram_id: int) -> dict | None:
     """Return a message of a chat, sent by Zoe or by the person, found by its Telegram id."""
     row = conn.execute(
-        "SELECT direction, text, payload, created_at FROM messages WHERE chat_id = ? AND telegram_id = ? "
+        "SELECT id, direction, text, payload, created_at FROM messages WHERE chat_id = ? AND telegram_id = ? "
         "ORDER BY id DESC LIMIT 1",
         (chat_id, telegram_id),
     ).fetchone()
     if row is None:
         return None
     return {
+        "id": row["id"],
         "mine": row["direction"] == "out",
         "text": row["text"] or "",
         "payload": json.loads(row["payload"]) if row["payload"] else {},
@@ -340,20 +349,45 @@ def latest(conn: sqlite3.Connection, chat_id: int, telegram_id: int) -> bool:
     ).fetchone() is None
 
 
-def recent_history(conn: sqlite3.Connection, chat_id: int, limit: int = 10, before: int | None = None) -> list[dict]:
+def recent_history(conn: sqlite3.Connection, chat_id: int, limit: int = 10, before: int | None = None,
+                   since: float | None = None) -> list[dict]:
     """Return the last completed exchanges of a chat, oldest first, for conversation context; with
-    ``before``, those that came before that message.
+    ``before``, those that came before that message; with ``since``, only those logged from that time on.
 
-    Plans Zoe ran and news from her parallel minds are left out: they are her own
-    business, and only what she sent about them is part of the chat. A message sent
+    Plans Zoe ran, news from her parallel minds and tasks of programs are left out: they
+    are her own business, and only what she sent about them is part of the chat. A message sent
     as a reply carries the description of the message it answered.
     """
     rows = conn.execute(
         "SELECT direction, text, telegram_id, json_extract(payload, '$.reply') AS reply FROM messages "
-        "WHERE chat_id = ? AND text IS NOT NULL AND state = 'answered' AND kind NOT IN ('plan', 'mind') "
-        "AND (? IS NULL OR id < ?) ORDER BY id DESC LIMIT ?",
-        (chat_id, before, before, limit),
+        f"WHERE chat_id = ? AND text IS NOT NULL AND state = 'answered' AND {NOT_OWN_WORK} "
+        "AND (? IS NULL OR id < ?) AND (? IS NULL OR created_at >= ?) ORDER BY id DESC LIMIT ?",
+        (chat_id, before, before, since, since, limit),
     ).fetchall()
+    return _turns(rows)
+
+
+def unseen(conn: sqlite3.Connection, chat_id: int, heard: int, told: int, limit: int = 20) -> list[dict]:
+    """Return what a chat said that a turn's session never saw, oldest first, shaped as in ``recent_history``:
+    the person's messages logged after ``heard``, the last one the turn read, whether answered yet or not, and
+    every message logged after ``told``, the last one logged once the turn had answered. Zoe's own work is left
+    out, as there."""
+    rows = conn.execute(
+        "SELECT direction, text, telegram_id, json_extract(payload, '$.reply') AS reply FROM messages "
+        "WHERE chat_id = ? AND text IS NOT NULL AND state IN ('received', 'processing', 'answered') "
+        f"AND {NOT_OWN_WORK} AND id > ? AND (direction = 'in' OR id > ?) ORDER BY id DESC LIMIT ?",
+        (chat_id, heard, told, limit),
+    ).fetchall()
+    return _turns(rows)
+
+
+def last_logged(conn: sqlite3.Connection, chat_id: int) -> int:
+    """The id of the latest message logged in a chat, or 0."""
+    return conn.execute("SELECT COALESCE(MAX(id), 0) FROM messages WHERE chat_id = ?", (chat_id,)).fetchone()[0]
+
+
+def _turns(rows: list[sqlite3.Row]) -> list[dict]:
+    """Messages read newest first, as the conversation shows them: oldest first, each with what it replies to."""
     return [
         {"direction": r["direction"], "text": r["text"], "telegram_id": r["telegram_id"],
          "reply": json.loads(r["reply"]) if r["reply"] else None}

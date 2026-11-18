@@ -5,6 +5,9 @@ her own. It runs the service as a child process and:
 
 - refuses to start when another Zoe runs with the same home, and hands its lock
   to the service;
+- starts the service each time with the environment the launcher itself got and
+  the ``.env`` file as it is at that moment, so a setting changed, emptied or
+  deleted in the file takes effect at the next restart;
 - starts it again when it exits with ``RESTART``, as it does after a core change;
 - trusts a commit only once it has proven itself: for ``STABLE_SECONDS`` the
   service's heartbeat (``health.py``) says every part of it is alive, and it has
@@ -28,10 +31,11 @@ import signal
 import subprocess
 import sys
 import time
+from collections.abc import Mapping
 from pathlib import Path
 
 from . import health, instance, notices
-from .config import Config
+from .config import Config, env_file, read_dotenv
 
 RESTART = 3
 STABLE_SECONDS = 90
@@ -50,6 +54,11 @@ def decide(code: int | None, proven: bool, head: str, last_good: str | None) -> 
     if not proven and last_good and head != last_good:
         return "rollback"
     return "retry"
+
+
+def service_env(inherited: Mapping[str, str], dotenv: Path) -> dict[str, str]:
+    """Return the service's environment: the one the launcher got, under the file as it is now."""
+    return {**inherited, **read_dotenv(dotenv), instance.HELD: "1"}
 
 
 def _git(repo: Path, *args: str) -> str:
@@ -82,7 +91,9 @@ def _stop(child: subprocess.Popen) -> None:
 
 
 def main() -> int:
-    cfg = Config.from_env()
+    inherited = dict(os.environ)
+    dotenv = env_file()
+    cfg = Config.from_env(dotenv)
     lock = instance.hold(cfg.data_dir)
     if lock is None:
         print(f"another Zoe is already running with {cfg.data_dir}", file=sys.stderr)
@@ -106,7 +117,7 @@ def main() -> int:
         (cfg.data_dir / health.FILE).unlink(missing_ok=True)
         started = time.monotonic()
         child = subprocess.Popen(
-            [sys.executable, "-m", "zoe"], cwd=CORE_ROOT, env={**os.environ, instance.HELD: "1"},
+            [sys.executable, "-m", "zoe"], cwd=CORE_ROOT, env=service_env(inherited, dotenv),
             pass_fds=() if os.name == "nt" else (lock.fileno(),),
         )
         proven = False

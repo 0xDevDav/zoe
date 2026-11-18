@@ -146,6 +146,19 @@ class Brain:
             neuron_id = row[0]
         return neuron_id
 
+    def current(self, ids: Iterable[int]) -> list[int]:
+        """These neurons as the graph holds them now, in order and each once: one merged into
+        another since is that other, one deleted is left out. Whoever names a neuron some time
+        after reading it, such as a reply naming the memories its turn recalled when it began,
+        reaches the graph through here, so a merge or a deletion meanwhile breaks nothing."""
+        found: list[int] = []
+        for neuron_id in ids:
+            neuron_id = self.kept(neuron_id)
+            if neuron_id not in found and self._conn.execute(
+                    "SELECT 1 FROM neurons WHERE id = ?", (neuron_id,)).fetchone():
+                found.append(neuron_id)
+        return found
+
     def anchored(self, telegram_ids: list[int]) -> list[int]:
         """Return the episodes that hold any of these Telegram messages."""
         ids: list[int] = []
@@ -171,9 +184,12 @@ class Brain:
         return [(r["source"], r["target"], r["weight"]) for r in rows]
 
     def connect(self, a: int, b: int, delta: float = 0.15, max_weight: float = 1.0) -> None:
-        """Strengthen the link between two neurons in both directions."""
-        if a == b:
-            return
+        """Strengthen the link between two neurons in both directions, as the graph holds them now:
+        nothing when one of them is gone or both are one."""
+        for a, b in combinations(self.current((a, b)), 2):
+            self._link(a, b, delta, max_weight)
+
+    def _link(self, a: int, b: int, delta: float = 0.15, max_weight: float = 1.0) -> None:
         now = time.time()
         for source, target in ((a, b), (b, a)):
             self._conn.execute(
@@ -186,6 +202,7 @@ class Brain:
 
     def fire(self, ids: list[int], energy: float = 1.0) -> None:
         """Activate neurons and wire together every pair that fired at once, in one transaction."""
+        ids = self.current(ids)
         if not ids:
             return
         now = time.time()
@@ -198,8 +215,8 @@ class Brain:
                 "WHERE id = ?",
                 [(energy, now, nid) for nid in ids],
             )
-            for a, b in combinations(sorted(set(ids)), 2):
-                self.connect(a, b)
+            for a, b in combinations(ids, 2):
+                self._link(a, b)
         except BaseException:
             if own:
                 self._conn.execute("ROLLBACK")
@@ -326,17 +343,19 @@ class Brain:
         whatever is recalled once be recalled every time after.
         """
         nid = self.add(kind, content, salience=salience)
-        for other in related or []:
-            self.connect(nid, other)
+        for other in self.current(related or []):
+            self._link(nid, other)
         self.fire([nid])
         return nid
 
     def reinforce(self, used: list[int], unused: list[int], fade: float = 0.7) -> None:
         """Learn from what one reply used of what recall brought: what was used together wires
         together, and the links that pulled in what went unused alongside it weaken."""
+        used = self.current(used)
         if not used:
             return
         self.fire(used)
+        unused = [n for n in self.current(unused) if n not in used]
         if unused:
             u, n = ",".join("?" * len(used)), ",".join("?" * len(unused))
             self._conn.execute(

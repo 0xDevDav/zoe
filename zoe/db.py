@@ -32,6 +32,16 @@ _ADDED_COLUMNS = (
     ("outbox", "options", "TEXT"),
     ("minds", "phases", "TEXT"),
     ("minds", "phase", "INTEGER NOT NULL DEFAULT 0"),
+    ("model_choices", "needed", "INTEGER"),
+    ("model_choices", "judge", "TEXT NOT NULL DEFAULT ''"),
+    ("model_choices", "judge_level", "INTEGER"),
+    ("model_choices", "judge_reason", "TEXT NOT NULL DEFAULT ''"),
+    ("model_choices", "judge_seconds", "REAL"),
+    ("model_choices", "rules_level", "INTEGER"),
+    ("minds", "reminded_at", "REAL"),
+    ("finished_work", "tools", "INTEGER"),
+    ("finished_work", "reviewed_at", "REAL"),
+    ("minds", "task_keys", "TEXT"),
 )
 
 

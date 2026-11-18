@@ -23,7 +23,7 @@ import time
 from dataclasses import dataclass
 from pathlib import Path
 
-from . import access, approve, i18n, minds, observer, recall_eval, review, store
+from . import access, approve, i18n, minds, observer, recall_eval, review, store, strength
 from .access import Person
 from .brain import Brain
 from .claude_runner import ClaudeRunner
@@ -83,10 +83,16 @@ def _clean(value: object) -> str:
 
 
 def record(conn: sqlite3.Connection, answer: dict, now: float) -> list[int]:
-    """Keep the proposals of a study's answer, at most MOST, each with a title, a benefit and a
-    plan, and its summary; return the new proposals' ids."""
+    """Keep the proposals of a study's answer, at most MOST, and its summary; return the new proposals' ids."""
+    kept = keep(conn, answer.get("proposals") or [], now)
+    store.set_state(conn, SUMMARY, _clean(answer.get("summary"))[:500])
+    return kept
+
+
+def keep(conn: sqlite3.Connection, items: list, now: float, most: int = MOST) -> list[int]:
+    """Keep at most ``most`` proposals, each with a title, a benefit and a plan; return their ids."""
     kept = []
-    for item in (answer.get("proposals") or [])[:MOST]:
+    for item in items[:most]:
         if not isinstance(item, dict):
             continue
         title, benefit, plan = _clean(item.get("title"))[:120], _clean(item.get("benefit")), _clean(item.get("plan"))
@@ -97,7 +103,6 @@ def record(conn: sqlite3.Connection, answer: dict, now: float) -> list[int]:
             (title, benefit, plan, _clean(item.get("checked")), 1 if item.get("careful") else 0, now),
         )
         kept.append(int(cur.lastrowid))
-    store.set_state(conn, SUMMARY, _clean(answer.get("summary"))[:500])
     return kept
 
 
@@ -132,13 +137,25 @@ def drop(conn: sqlite3.Connection, proposal_id: int) -> bool:
     ).rowcount > 0
 
 
+def earlier(conn: sqlite3.Connection, person: Person) -> list[str]:
+    """The latest proposals made, waiting, approved or set aside, as lines that keep a new one from repeating them."""
+    shown = {"waiting": [], "approved": [], "rejected": []}
+    for row in conn.execute("SELECT * FROM proposals ORDER BY id DESC LIMIT ?", (_SHOWN,)).fetchall():
+        proposal = _proposal(row)
+        shown[proposal.state].append(f"- {proposal.title}: {proposal.benefit}")
+    lines = []
+    for state, heading in (("waiting", "Proposals still waiting for an answer (do not repeat them):"),
+                           ("approved", "Proposals approved and made:"),
+                           ("rejected", f"Proposals {person.name} set aside: never again, unless something "
+                                        "changed, and then say what:")):
+        if shown[state]:
+            lines += [f"\n{heading}", *shown[state]]
+    return lines
+
+
 def build_prompt(conn: sqlite3.Connection, person: Person, db_path: Path, recall: str = "") -> str:
     """The study's prompt; ``recall`` is the line on how well recall works, when it was measured."""
     language = i18n.language_name(person.language)
-    earlier = conn.execute("SELECT * FROM proposals ORDER BY id DESC LIMIT ?", (_SHOWN,)).fetchall()
-    shown = {"waiting": [], "approved": [], "rejected": []}
-    for proposal in map(_proposal, earlier):
-        shown[proposal.state].append(f"- {proposal.title}: {proposal.benefit}")
     lines = [
         f"You are Zoe, the personal assistant of {person.name}. Tonight you study how you work, to find what "
         f"would make {person.name}'s life easier, so they do not have to think up and explain every function "
@@ -154,12 +171,7 @@ def build_prompt(conn: sqlite3.Connection, person: Person, db_path: Path, recall
     ]
     if recall:
         lines.append(recall)
-    for state, heading in (("waiting", "Proposals still waiting for an answer (do not repeat them):"),
-                           ("approved", "Proposals approved and made:"),
-                           ("rejected", f"Proposals {person.name} set aside: never again, unless something "
-                                        "changed, and then say what:")):
-        if shown[state]:
-            lines += [f"\n{heading}", *shown[state]]
+    lines += earlier(conn, person)
     lines.append(
         "\nAnswer with one JSON object and nothing else:\n"
         '{"proposals": [{"title": "...", "benefit": "...", "plan": "...", "checked": "...", "careful": false}], '
@@ -190,7 +202,10 @@ def study(
     profile = approve.asking(access.turn_profile(owner, cfg), cfg.data_dir, None)
     recall_eval.renew(conn, cfg, owner, now)
     recall = recall_eval.summary(conn, cfg, owner)
-    result = runner.run(build_prompt(conn, owner, cfg.db_path, recall), profile, cancel=cancel)
+    choice = strength.record(conn, strength.for_study(cfg), "study")
+    result = runner.run(build_prompt(conn, owner, cfg.db_path, recall), profile, cancel=cancel,
+                        model=choice.model, effort=choice.effort)
+    strength.ended(conn, choice.id, strength.outcome(result), result.duration)
     if result.cancelled:
         return []
     store.set_state(conn, STATE, str(now))

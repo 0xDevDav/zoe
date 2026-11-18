@@ -43,6 +43,8 @@ def test_a_study_keeps_at_most_two_complete_proposals_and_what_it_learned():
         assert [improve.get(conn, n).title for n in kept] == ["Album per i caroselli", "Avviso spese"]
         assert improve.get(conn, kept[1]).careful and store.get_state(conn, improve.SUMMARY) == ANSWER["summary"]
         assert store.get_state(conn, improve.STATE) == "1000.0" and runner.profiles[0].cwd == cfg.workdir
+        assert runner.models[0] == (cfg.claude_model, "xhigh")
+        assert tuple(conn.execute("SELECT source, outcome FROM model_choices").fetchone()) == ("study", "answered")
 
         improve.drop(conn, kept[1])
         assert improve.study(conn, cfg, runner, 2000.0) == []

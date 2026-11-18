@@ -22,12 +22,12 @@ import re
 import threading
 import time
 import urllib.parse
-from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 
 from . import access, i18n
 from .config import Config
 from .db import connect
+from .localhttp import Answering, LocalServer
 from .menu import Menu
 from .telegram import TelegramAPI
 
@@ -66,18 +66,15 @@ def signer(init_data: str, token: str, now: float) -> int | None:
         return None
 
 
-class _Server(ThreadingHTTPServer):
-    daemon_threads = True
-    # How often the serving loop looks at the stop signal.
-    timeout = 1.0
-
+class _Server(LocalServer):
     def __init__(self, cfg: Config, menu: Menu, token: str) -> None:
-        super().__init__(("127.0.0.1", cfg.menu_port), _Handler)
+        super().__init__(cfg.menu_port, _Handler)
         self.cfg, self.menu, self.token = cfg, menu, token
 
 
-class _Handler(BaseHTTPRequestHandler):
+class _Handler(Answering):
     server: _Server
+    HEADERS = _HEADERS
 
     def do_GET(self) -> None:
         *_, folder, name = ("/" + urllib.parse.urlsplit(self.path).path).split("/")
@@ -134,22 +131,6 @@ class _Handler(BaseHTTPRequestHandler):
         """The last part of the path: the proxy forwards the menu's whole address, prefix included."""
         return urllib.parse.urlsplit(self.path).path.rsplit("/", 1)[-1]
 
-    def _json(self, status: int, value: object) -> None:
-        self._send(status, json.dumps(value, ensure_ascii=False).encode(), "application/json")
-
-    def _send(self, status: int, body: bytes, kind: str) -> None:
-        self.send_response(status)
-        self.send_header("Content-Type", kind)
-        self.send_header("Content-Length", str(len(body)))
-        for name, value in _HEADERS.items():
-            self.send_header(name, value)
-        self.end_headers()
-        self.wfile.write(body)
-
-    def log_message(self, format: str, *args: object) -> None:
-        # The proxy logs requests already.
-        pass
-
 
 class MenuServer(threading.Thread):
     """Serves the menu until ``stop`` is set. The port is taken when the server is made, so
@@ -163,7 +144,5 @@ class MenuServer(threading.Thread):
 
     def run(self) -> None:
         log.info("menu served on 127.0.0.1:%d", self.port)
-        with self._server:
-            while not self._halt.is_set():
-                self._server.handle_request()
+        self._server.serve_until(self._halt)
         log.info("menu stopped")

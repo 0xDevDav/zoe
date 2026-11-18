@@ -41,12 +41,21 @@ tests for every change in behavior.
 Fix what they report and run both again until they pass. Never weaken a test to
 make it pass.
 
+When the owner explicitly asked for a change to a protected part listed in
+`PRINCIPLES.md`, run `zoe-evolve review <target> <short-name> --owner-approved`:
+the reviewer then judges the change knowing the owner asked for it. Never add the
+flag without that request.
+
+The review's verdict is final: never edit `~/.zoe/evolve/state.json` or the
+history next to it. Apply goes only by the reviewer's last verdict in the
+history, so a verdict written into `state.json` does not count.
+
 ## 4. Apply
 
     zoe-evolve apply <target> <short-name> -m "<one line in English: what changes and why>"
 
-Add `--owner-approved` only when the owner explicitly asked for a change to a
-protected part listed in `PRINCIPLES.md`.
+Add `--owner-approved` when the review ran with it: apply needs it for a change to
+a protected part, and accepts it only after a review run with the flag.
 
 Then remove what the change replaces: a script, a tool or a written rule that
 did the same job some other way.

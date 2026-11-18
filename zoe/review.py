@@ -72,7 +72,7 @@ def conversations(conn: sqlite3.Connection, person_id: int, since: float) -> lis
     """The person's finished messages since ``since``, the latest ``_MESSAGES`` of them, oldest first."""
     rows = conn.execute(
         "SELECT telegram_id, direction, text, created_at FROM messages "
-        "WHERE person_id = ? AND state = 'answered' AND text IS NOT NULL AND kind NOT IN ('plan', 'mind') "
+        f"WHERE person_id = ? AND state = 'answered' AND text IS NOT NULL AND {store.NOT_OWN_WORK} "
         "AND created_at > ? ORDER BY id DESC LIMIT ?",
         (person_id, since, _MESSAGES),
     ).fetchall()

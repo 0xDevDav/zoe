@@ -1,4 +1,10 @@
-"""Runtime configuration, loaded from the environment or an optional .env file.
+"""Runtime configuration, loaded from an optional .env file and the environment.
+
+A setting the file names takes the file's value as it is when the process starts,
+over the one in the environment: a process inherits its environment from one that
+may have read an older version of the file, as the service does from its launcher,
+so only the file can say what a setting is now. The environment sets the rest,
+``ZOE_HOME`` first.
 
 Everything personal lives under ``ZOE_HOME`` (``~/.zoe`` by default), outside the
 source tree: the configuration file, the database with the neuron graph, the
@@ -18,15 +24,22 @@ from pathlib import Path
 from . import i18n
 
 
-def load_dotenv(path: Path) -> None:
+def read_dotenv(path: Path) -> dict[str, str]:
+    """Return the settings the file names, none when it does not exist."""
+    settings: dict[str, str] = {}
     if not path.exists():
-        return
+        return settings
     for line in path.read_text(encoding="utf-8").splitlines():
         line = line.strip()
         if not line or line.startswith("#") or "=" not in line:
             continue
         key, value = line.split("=", 1)
-        os.environ.setdefault(key.strip(), value.strip().strip('"').strip("'"))
+        settings[key.strip()] = value.strip().strip('"').strip("'")
+    return settings
+
+
+def load_dotenv(path: Path) -> None:
+    os.environ.update(read_dotenv(path))
 
 
 def home() -> Path:
@@ -65,17 +78,28 @@ class Config:
     workers: int = 3
     default_language: str = i18n.DEFAULT
     claude_bin: str = "claude"
+    # The model every turn, parallel mind and study runs on, at the effort strength.py gives it.
     claude_model: str = "claude-opus-5-5"
+    # Whether the person sees the model and effort of each run: under every reply, beside each parallel mind.
+    show_strength: bool = False
     claude_timeout: float = 1800.0
     claude_inactivity_timeout: float = 240.0
     claude_background_timeout: float = 14400.0
     max_attempts: int = 2
+    # The model of the short runs beside the chat: the observer, recall checks, notices read with their chat.
     observer_model: str = "claude-sonnet-5-5"
     observer_idle: float = 600.0
+    # Tools a finished owner turn or parallel mind must have run to be reviewed for lessons (0: no reviews),
+    # and the most lesson reviews in a day (lessons.py).
+    lesson_tools: int = 10
+    lessons_per_day: int = 12
     minds: int = 2
     mind_timeout: float = 14400.0
     mind_inactivity_timeout: float = 1800.0
     mind_min_free_mb: int = 1024
+    # Commands that publish work, beside ``git commit``, each as its words with ``*`` for any one word:
+    # a mind that launched one and tells nothing for some minutes is asked for its news (minds.py).
+    publish_commands: tuple[str, ...] = ()
     temp_file_days: float = 7.0
     whisper_url: str = "http://127.0.0.1:8790"
     glossary_chars: int = 700
@@ -114,16 +138,21 @@ class Config:
             default_language=i18n.normalize(env("ZOE_DEFAULT_LANG"), i18n.DEFAULT),
             claude_bin=env("ZOE_CLAUDE_BIN", "claude"),
             claude_model=env("ZOE_CLAUDE_MODEL", "claude-opus-5-5"),
+            show_strength=env("ZOE_SHOW_STRENGTH", "").strip().lower() in ("1", "true", "yes", "on"),
             claude_timeout=float(env("ZOE_CLAUDE_TIMEOUT", "1800")),
             claude_inactivity_timeout=float(env("ZOE_CLAUDE_INACTIVITY_TIMEOUT", "240")),
             claude_background_timeout=float(env("ZOE_CLAUDE_BACKGROUND_TIMEOUT", "14400")),
             max_attempts=int(env("ZOE_MAX_ATTEMPTS", "2")),
             observer_model=env("ZOE_OBSERVER_MODEL", "claude-sonnet-5-5"),
             observer_idle=float(env("ZOE_OBSERVER_IDLE", "600")),
+            lesson_tools=int(env("ZOE_LESSON_TOOLS", "10")),
+            lessons_per_day=int(env("ZOE_LESSONS_PER_DAY", "12")),
             minds=max(1, int(env("ZOE_MINDS", "2"))),
             mind_timeout=float(env("ZOE_MIND_TIMEOUT", "14400")),
             mind_inactivity_timeout=float(env("ZOE_MIND_INACTIVITY_TIMEOUT", "1800")),
             mind_min_free_mb=int(env("ZOE_MIND_MIN_FREE_MB", "1024")),
+            publish_commands=tuple(
+                " ".join(command.split()) for command in env("ZOE_PUBLISH_COMMANDS", "").split(",") if command.strip()),
             temp_file_days=float(env("ZOE_TEMP_FILE_DAYS", "7")),
             whisper_url=env("ZOE_WHISPER_URL", "http://127.0.0.1:8790").strip(),
             glossary_chars=int(env("ZOE_GLOSSARY_CHARS", "700")),

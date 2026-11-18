@@ -15,7 +15,7 @@ from dataclasses import dataclass
 from datetime import datetime
 from pathlib import Path
 
-from . import access, directives, files, i18n, minds, observer, planner, signals, store, style
+from . import access, directives, files, i18n, minds, observer, planner, signals, store, strength, style, tasks
 from .access import Person
 from .brain import Brain, Recalled
 
@@ -52,10 +52,17 @@ _MINDS = (
     "beyond a few minutes, do not do it in this turn: start a parallel mind, which works on its own while the "
     "chat stays free, and tell the person you did. Write it as:\n"
     "[[{k} mind: Short title | /optional/folder]]\n"
-    "The complete brief: the goal, where to work, constraints, and how to verify it is done. The mind does not "
-    "see this chat.\n"
+    "A short brief: the result expected, where to work, the constraints that are real, who tries the result, "
+    "and the one or two checks that matter.\n"
     "[[/mind]]\n"
+    "The mind does not see this chat: tell it what it cannot find out alone, and leave to it how to do the "
+    "work. It studies and tests by what a mistake costs, so list no "
+    "cases to test for what the person tries for themselves in seconds, such as a screen or a text, and ask "
+    "for full tests only where a mistake costs: " + strength.COSTLY + ". "
     "To pass a note or an answer to a mind, add [[{k} tell: 3 | text]]; to stop one, [[{k} stop: 3]]. "
+    "A mind does something small asked about its work first and sends you news of it within minutes, while it "
+    "goes on: when you pass such a request on, tell the person so, never that it comes with the rest of the "
+    "work. "
     "A mind never writes to the chat itself: it reports to you, so ask it for the full path of every file to "
     "show, and send them when its news arrives."
 )
@@ -68,9 +75,20 @@ _WAITING = (
     "than two minutes, and reply once it is done. Only what takes longer, such as a print, a render or a long "
     "download, is left running in the background: reply right away with a single line saying what started and "
     "about how long it takes, nothing more. The chat stays free; when the task ends you are woken in this same "
-    "session, and what you write then takes the place of your last message about it, edited in place, or "
-    "sent anew below when other messages came after it. Write it whole, as that message should read now, and "
-    "never repeat in a result what an earlier update already told the person."
+    "session, and what you write then takes the place of your last message about it, options included, edited "
+    "in place, or sent anew below when other messages came after it. Write it whole, as that message should read "
+    "now, and never repeat in a result what an earlier update already told the person. If the chat went on "
+    "after your last message, you are shown what it said before anything goes out. When there is nothing new "
+    "to tell, as when another turn already closed the work or stopped your wait, reply only with "
+    "[[{k} skip: the reason]]: nothing is sent and your last message stays as it is."
+)
+
+# The measure of a turn's own checks, the one a parallel mind works by.
+_MEASURE = (
+    "A touch-up the person sees at once and one command undoes, such as a text, a graphic, an alignment or a "
+    "figure, you do in this turn, without a parallel mind: run the checks that already exist, write no new "
+    "tests, and say what you did not try. Full tests are for where a mistake costs: " + strength.COSTLY + ". "
+    "Your own code and skills are never such a touch-up: they change only through your pipeline, with its tests."
 )
 
 _SELF = (
@@ -123,6 +141,17 @@ RESUMED = (
     "Your previous run of this turn was stopped: it ran too long or went silent. Check what is already "
     "done before doing anything again, and do not repeat what has been done (messages sent, files changed, "
     "orders placed). Then finish the work and reply."
+)
+
+# What a copy of a woken session is told when the chat went on after its last message, before its answer goes.
+_CAUGHT_UP = (
+    "Your reply above has not gone out. While you waited in the background, the chat went on without you, and "
+    "you did not see it; what is marked You was written in your other turns:\n{news}\n"
+    "Write now, whole, the reply that should go out after all this: it takes the place of your last message "
+    "about this work{replaced}. Never tell again what those messages already told {name}, nor ask what they "
+    "already answered. When there is nothing new to tell, as when another turn already closed the work or "
+    "stopped your wait, reply only with [[{k} skip: the reason]]: nothing is sent and your last message stays "
+    "as it is. Do not redo work that is done, and start nothing new."
 )
 
 STOPPED_WAITS = (
@@ -229,17 +258,8 @@ def _minds(conn: sqlite3.Connection, person: Person, key: str) -> list[str]:
     if working or ended:
         lines.append("Your parallel minds (leave the folder of a working one to it):")
     now = time.time()
-    for mind in working:
-        if mind.state == "asking":
-            status = f"waiting for an answer to: {mind.question}"
-        elif mind.state == "queued":
-            status = "about to start" + (" again" if mind.session_id else "")
-        else:
-            status = f"working for {minds.duration(now - (mind.started_at or now))}"
-            status += f", last steps: {'; '.join(mind.steps[-3:])}" if mind.steps else ""
-        lines.append(f"- #{mind.id} «{mind.title}» in {mind.workdir}, {status}")
-    for mind in ended:
-        lines.append(f"- #{mind.id} «{mind.title}» {mind.state} {minds.duration(now - (mind.finished_at or now))} ago")
+    lines += [f"- #{mind.id} «{mind.title}» in {mind.workdir}, {minds.status(mind, now)}" for mind in working]
+    lines += [f"- #{mind.id} «{mind.title}» {minds.status(mind, now)}" for mind in ended]
     return lines
 
 
@@ -341,13 +361,22 @@ _MIND_NEWS = {
     "ask": "needs a decision to go on: {text}\nAsk {name}. When they answer, pass the answer on with "
            "[[{k} tell: {id} | the answer]].",
     "failed": "stopped without finishing: {text}\nTell {name}, and offer to start it again or to change approach.",
+    "news": "is still at work and sends this news:\n{text}\nTell {name} now, in your own words and as briefly "
+            "as it allows, what waits for them included, and send the files it gives for them to see: news of a "
+            "mind at work is never kept for its final report.",
 }
+# What Zoe is told when a mind finishes after sending news: only what its report adds is left to tell.
+_MIND_ADDS = (
+    "has finished. Its report:\n{text}\nWhile it worked you already passed on this news of it:\n{told}\n"
+    "Tell {name} in your words only what the report adds to that news: what is new, anything left open, and "
+    "the files it gives that they have not seen. Never repeat what the news already told them."
+)
 
 
 def update(conn: sqlite3.Connection, person: Person, chat_id: int,
            news: list[tuple[int | None, str, dict | None]], own_work: bool = False) -> str:
     """What resumes a turn interrupted by messages the person wrote while it worked, each with what
-    the message it replies to held. A turn of Zoe's ``own_work``, a plan or a mind's news, owes
+    the message it replies to held. A turn of Zoe's ``own_work``, a plan, a mind's news or a task, owes
     them a reply even when that work alone would send nothing."""
     lines = [f"While you were working, {person.name} wrote:"]
     lines += [_said(conn, chat_id, person, person.name, telegram_id, text, reply) for telegram_id, text, reply in news]
@@ -357,6 +386,18 @@ def update(conn: sqlite3.Connection, person: Person, chat_id: int,
     ))
     lines.append(_reply_in(person))
     return "\n".join(lines)
+
+
+def caught_up(conn: sqlite3.Connection, person: Person, chat_id: int, unseen: list[dict], replaced: int | None,
+              key: str) -> str:
+    """What a copy of a woken session is told before its answer goes: the messages of the chat it never saw
+    (``store.unseen``) and that its answer, which takes the place of message ``replaced``, may be sent anew or
+    not at all."""
+    news = "\n".join(_said(conn, chat_id, person, "You" if turn["direction"] == "out" else person.name,
+                           turn["telegram_id"], _cut(turn["text"], _TURN), turn["reply"]) for turn in unseen)
+    asked = directives.keyed(_CAUGHT_UP, key).format(news=news, name=person.name,
+                                                     replaced=f" (#{replaced})" if replaced else "")
+    return f"{asked}\n{_reply_in(person)}"
 
 
 def _reply_in(person: Person) -> str:
@@ -373,10 +414,13 @@ def _ending(
     mind: dict | None,
     followups: list[str],
     key: str,
+    task: dict | None = None,
 ) -> str:
     if mind is not None:
         # format() fills the template only: the mind's text is never searched for {k}.
-        news = _MIND_NEWS[mind["event"]].format(text=text, name=person.name, id=mind["mind"], k=key)
+        told = "\n".join(f"- {_cut(line, _MEMORY)}" for line in mind.get("told") or [])
+        news = (_MIND_ADDS if told else _MIND_NEWS[mind["event"]]).format(
+            text=text, name=person.name, id=mind["mind"], k=key, told=told)
         said = f"\nYour parallel mind #{mind['mind']} «{mind['title']}» {news}"
     elif plan is not None:
         said = (
@@ -386,9 +430,21 @@ def _ending(
             f"If nothing needs to be sent, reply only with [[{key} skip: the reason]]: the reason is remembered, "
             "never shown."
         )
+    elif task is not None:
+        taken = (
+            "When it needs a parallel mind, start one: the mind takes the task on, and while it works a later "
+            f"task on the same thing goes to it as a note and reaches neither you nor {person.name}. "
+        ) if task.get("keys") else ""
+        said = (
+            f"\nThe program «{tasks.origin(task)}» on this machine hands you a task: {text}\n"
+            f"Do it now: {person.name}'s own programs ask it of you. {taken}What you write is sent to "
+            f"{person.name} as a message from you, right after the conversation above: if you were talking about "
+            f"something else, bring it in naturally. If nothing needs to be sent, reply only with "
+            f"[[{key} skip: the reason]]: the reason is remembered, never shown."
+        )
     else:
         said = "\n" + "\n".join([f"{anchor(telegram_id)}{person.name}: {text}", *followups])
-    if followups and (mind is not None or plan is not None):
+    if followups and (mind is not None or plan is not None or task is not None):
         said += "\n" + "\n".join([f"{person.name} also wrote:", *followups, _OWED.format(name=person.name)])
     return f"{said}\n{_reply_in(person)}\nYou:"
 
@@ -422,10 +478,11 @@ def build(
     key: str = "",
     temp_file_days: float = 7.0,
     archive: Path | None = None,
+    task: dict | None = None,
 ) -> tuple[str, Recall]:
     """Return the prompt string and what it brought back from memory.
 
-    A due plan and news from a parallel mind are given as their queued payloads,
+    A due plan, news from a parallel mind and a program's task are given as their queued payloads,
     a reply as the description of the message it answers, and the messages the
     person sent right after the first as (Telegram id, text, the reply's description). Recall starts from
     the neuron of the plan or of the mind's task, from the one behind a message of
@@ -450,7 +507,8 @@ def build(
     parts.append(directives.how(key))
     parts.append(directives.keyed(style.SPOKEN if spoken else style.TELEGRAM, key))
     parts.extend(_plans(conn, person, key))
-    parts.append(_WAITING)
+    parts.append(directives.keyed(_WAITING, key))
+    parts.append(_MEASURE)
     parts.extend(_minds(conn, person, key))
     if person.role == "owner":
         parts.append(_SELF.format(name=person.name))
@@ -481,5 +539,5 @@ def build(
     if replied:
         parts.append(replied.line)
     shown = [_said(conn, chat_id, person, person.name, number, words, quoted) for number, words, quoted in followups]
-    parts.append(_ending(person, text, telegram_id, plan, mind, shown, key))
+    parts.append(_ending(person, text, telegram_id, plan, mind, shown, key, task))
     return "\n".join(parts), Recall([nid for nid in origins if nid], memories)

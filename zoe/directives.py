@@ -14,7 +14,8 @@ on either. The names:
 - ``plan: when | instruction``: do something later, at a local date and time or
   on a cron rule;
 - ``unplan: 12``: cancel a pending plan;
-- ``skip: reason``: a plan's run sends nothing; the reason is only remembered;
+- ``skip: reason``: a plan's run, or a session woken from its wait, sends nothing; the
+  reason is only remembered;
 - ``quote: 4521``: the reply answers the message with that Telegram id;
 - ``voice``: the reply is sent as a voice note, with its text under it;
 - ``edit: 4521``: the reply becomes the new text of Zoe's own message 4521;
@@ -25,8 +26,11 @@ on either. The names:
 - ``tell: 3 | text``: a note or an answer for parallel mind 3;
 - ``stop: 3``: stop parallel mind 3;
 - ``ask: question``: a parallel mind needs a decision to go on;
+- ``news: text``: a working parallel mind tells the person something now, and goes on;
 - ``phases: Read the code | Write | Test``: the phases of a parallel mind's work, and
-  ``phase: 2``: the phase it starts now, so the menu shows how far it is;
+  ``phase: 2``: the phase it starts now, so the menu shows how far it is; a mind writes
+  these lines and its news in a command it launches, where the service reads them at once,
+  since what a mind writes between two commands may never arrive as text;
 - ``admit: 123456789 | Name``: let that Telegram account write to Zoe, the name being optional;
 - ``keep: 12 | what it is | new place``: keep received file 12 for good, the new place
   given when Zoe moved it;
@@ -49,7 +53,8 @@ log = logging.getLogger("zoe.directives")
 MAX_OPTIONS = 8
 _OPTION_LENGTH = 40
 _NAMES = (
-    "term|react|options|plan|unplan|skip|quote|voice|edit|tell|stop|ask|phases|phase|admit|keep|discard|send|share|unshare|used"
+    "term|react|options|plan|unplan|skip|quote|voice|edit|tell|stop|ask|news|phases|phase|admit|keep|discard|send|share|unshare|"
+    "used"
 )
 _CODE = re.compile(r"<pre\b.*?</pre>|<code\b.*?</code>|```.*?```|`[^`\n]*`", re.IGNORECASE | re.DOTALL)
 
@@ -284,6 +289,11 @@ def ask(found: list[tuple[str, str]]) -> str | None:
     return next((value.strip() for name, value in found if name == "ask" and value.strip()), None)
 
 
+def news(found: list[tuple[str, str]]) -> list[str]:
+    """What a working mind tells the person now, each piece of news in order."""
+    return [value.strip() for name, value in found if name == "news" and value.strip()]
+
+
 _PHASES = 12
 _PHASE_LENGTH = 60
 
@@ -312,5 +322,5 @@ def edit(found: list[tuple[str, str]]) -> int | None:
 
 
 def skip(found: list[tuple[str, str]]) -> str | None:
-    """Return why a plan's run sends nothing, or None when it sends its reply."""
+    """Return why a plan's run or a woken session sends nothing, or None when it sends its reply."""
     return next((value.strip() or "-" for name, value in found if name == "skip"), None)

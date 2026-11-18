@@ -5,7 +5,9 @@ The runner turns those events into steps for a live progress view, keeps the
 final answer, and uses the stream as a heartbeat: a turn that emits nothing for
 ``inactivity_timeout`` seconds, or runs past ``hard_timeout``, is terminated and
 reported as stuck. Each turn is its own process, and whatever it left running
-in the background is stopped when that process ends. A turn may ask to have its
+in the background is stopped when that process ends. No command holds a run in
+the foreground for more than two minutes: Claude Code moves it to the background
+and wakes the session when it ends. A turn may ask to have its
 answer at once while background tasks are still open: its process then goes on
 by itself, followed until those tasks end, and its later answers come one by one.
 """
@@ -13,15 +15,19 @@ by itself, followed until those tasks end, and its later answers come one by one
 from __future__ import annotations
 
 import json
+import logging
 import os
+import re
 import signal
 import subprocess
 import threading
 import time
 from collections import deque
 from collections.abc import Callable, Iterator
-from dataclasses import dataclass, field, replace
+from dataclasses import dataclass, field
 from pathlib import Path
+
+log = logging.getLogger("zoe.claude")
 
 _STREAM_ARGS = ("--output-format", "stream-json", "--verbose", "--include-partial-messages")
 
@@ -120,9 +126,9 @@ def _blocks(event: dict) -> list[dict]:
 # Seconds a running tool may stay silent before the turn counts as stuck.
 TOOL_SILENCE = 1200.0
 
-# Milliseconds a command may hold a turn that answers first: Claude Code then moves it to
-# the background, where it runs on and is followed like any background task. 120 seconds
-# is the lowest limit Claude Code takes.
+# Milliseconds a command may hold a run in the foreground: Claude Code then moves it to the
+# background, where it runs on like any background task while the session works on, and
+# wakes the session when it ends. 120 seconds is the lowest limit Claude Code takes.
 FOREGROUND_LIMIT_MS = 120_000
 
 # Secrets the service itself reads from its environment, kept from every Claude run and from
@@ -139,6 +145,16 @@ _reported: tuple[dict, float] = ({}, 0.0)
 def reported() -> tuple[dict, float]:
     """The plan's usage the latest run reported, as Claude Code wrote it, and when it arrived."""
     return _reported
+
+
+def projects() -> Path:
+    """Where Claude Code keeps, for each folder it runs in, the sessions and the memory files of its turns."""
+    return Path(os.environ.get("CLAUDE_CONFIG_DIR") or Path.home() / ".claude") / "projects"
+
+
+def memory(cwd: Path) -> Path:
+    """The memory files of the turns that run in ``cwd``."""
+    return projects() / re.sub(r"[^A-Za-z0-9]", "-", str(cwd)) / "memory"
 
 
 def _inherited() -> dict[str, str]:
@@ -171,8 +187,11 @@ class ClaudeRunner:
         cancel: threading.Event | None = None,
         interrupt: threading.Event | None = None,
         follow_for: float = 0.0,
+        model: str = "",
+        effort: str = "",
     ) -> Result:
-        """Run one turn. Setting ``cancel`` stops it at once; setting ``interrupt`` stops it as
+        """Run one turn, on ``model`` when given instead of the runner's own, at ``effort`` when given
+        instead of Claude Code's default. Setting ``cancel`` stops it at once; setting ``interrupt`` stops it as
         soon as no tool is running, so a command is never cut in half. Both end with
         ``cancelled``, and the result carries the session id, so a later run can continue the
         same session with ``--resume``.
@@ -185,11 +204,8 @@ class ClaudeRunner:
         With ``follow_for`` seconds, a turn whose answer comes while background tasks are still
         open returns that answer at once, and the result's ``later`` follows the session on for
         at most that long: what Claude says when those tasks end arrives through
-        ``Later.answers``. That session goes on by itself and hears nothing said meanwhile.
-        No command holds such a turn longer than ``FOREGROUND_LIMIT_MS``."""
-        if follow_for:
-            profile = replace(profile, env={**profile.env, "BASH_MAX_TIMEOUT_MS": str(FOREGROUND_LIMIT_MS)})
-        session = _Session(self._start(prompt, profile), profile, on_step)
+        ``Later.answers``. That session goes on by itself and hears nothing said meanwhile."""
+        session = _Session(self._start(prompt, profile, model, effort), profile, on_step)
         start = time.monotonic()
         answer: _Answer | None = None
         while True:
@@ -204,11 +220,13 @@ class ClaudeRunner:
         session.end(stop)
         return session.result(answer, start, stop=stop)
 
-    def _start(self, prompt: str, profile: Profile) -> subprocess.Popen:
+    def _start(self, prompt: str, profile: Profile, model: str = "", effort: str = "") -> subprocess.Popen:
         # The prompt goes through stdin: an argument would be capped by the command line
         # (32K characters on Windows) and readable by every local user in the process list.
+        chosen = ("--model", model or self._model, *(("--effort", effort) if effort else ()))
+        log.info("claude starts with %s", " ".join(chosen))
         proc = subprocess.Popen(
-            [self._bin, "-p", "--model", self._model, *_STREAM_ARGS, *profile.args],
+            [self._bin, "-p", *chosen, *_STREAM_ARGS, *profile.args],
             cwd=str(profile.cwd),
             stdin=subprocess.PIPE,
             stdout=subprocess.PIPE,
@@ -216,7 +234,7 @@ class ClaudeRunner:
             text=True,
             encoding="utf-8",
             errors="replace",
-            env={**_inherited(), "IS_SANDBOX": "1", **profile.env},
+            env={**_inherited(), "IS_SANDBOX": "1", "BASH_MAX_TIMEOUT_MS": str(FOREGROUND_LIMIT_MS), **profile.env},
             start_new_session=True,
         )
 

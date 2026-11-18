@@ -89,6 +89,14 @@ summary::-webkit-details-marker { display: none; }
 .button.success { border-color: transparent; background: var(--accent); color: var(--on-accent); }
 .button.danger { color: var(--danger); }
 .button:active { transform: scale(0.98); }
+.chat { display: flex; flex-direction: column; gap: 10px; margin: 16px 0; }
+.bubble { max-width: 86%; padding: 10px 14px; background: var(--surface); border: 1px solid var(--line); border-radius: 18px; }
+.bubble.left { align-self: flex-start; border-bottom-left-radius: 6px; }
+.bubble.right { align-self: flex-end; border-bottom-right-radius: 6px; background: color-mix(in srgb, var(--accent) 14%, var(--surface)); border-color: color-mix(in srgb, var(--accent) 30%, transparent); }
+.bubble small { display: block; margin-bottom: 4px; color: var(--muted); font: 600 12px/1.2 var(--font-display); }
+.bubble div { white-space: pre-wrap; overflow-wrap: anywhere; font-size: 15px; line-height: 1.45; }
+.bubble.owner { border-color: var(--accent); }
+.bubble.waiting div { color: var(--muted); font-style: italic; }
 #toast { position: fixed; left: 16px; right: 16px; bottom: calc(16px + env(safe-area-inset-bottom)); padding: 12px 16px; border-radius: 12px; background: var(--text); color: var(--bg); text-align: center; font-size: 15px; }
 #toast[hidden] { display: none; }
 </style>

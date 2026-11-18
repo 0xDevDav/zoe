@@ -27,6 +27,42 @@ def test_a_program_speaks_in_zoes_name_and_she_knows_it():
         assert say.deliver(conn, api) == 0
 
 
+def test_labels_that_open_a_notice_stay_in_the_log_and_never_reach_the_person():
+    with tempfile.TemporaryDirectory() as tmp:
+        conn, owner, *_ = worker_setup(Path(tmp))
+        api = FakeAPI()
+        say.queue(conn, Path(tmp), OWNER, "[invoice alert] [inbox-watch]\n🧾 <b>Fattura</b> da Acme Ltd", origin="invoices")
+        report = Path(tmp) / "report.pdf"
+        report.write_bytes(b"%PDF")
+        say.queue(conn, Path(tmp), OWNER, "[backup alert] Backup di stanotte", file=report, origin="backup")
+        say.deliver(conn, api)
+        assert api.to(OWNER) == ["🧾 <b>Fattura</b> da Acme Ltd"]
+        assert api.files[-1][2] == "Backup di stanotte"
+        assert [turn["text"] for turn in store.recent_history(conn, OWNER)] == [
+            "[invoices] [invoice alert] [inbox-watch]\n🧾 <b>Fattura</b> da Acme Ltd",
+            "[backup] [file «report.pdf»] [backup alert] Backup di stanotte"]
+
+
+def test_only_labels_that_open_the_text_go_and_other_brackets_stay():
+    kept = [
+        "Il [invoice alert] di ieri è chiuso",
+        "[[abc123 note: done]] e poi il resto",
+        "[Apri](https://example.com/a) la pagina",
+        "<b>[invoice alert]</b> in grassetto",
+        "[x] fatto",
+        "[1/3] prima parte",
+        "[invoice alert]",
+    ]
+    with tempfile.TemporaryDirectory() as tmp:
+        conn, owner, *_ = worker_setup(Path(tmp))
+        api = FakeAPI()
+        for text in kept:
+            say.queue(conn, Path(tmp), OWNER, text, origin="invoices")
+        say.queue(conn, Path(tmp), OWNER, '[invoice alert] Vedi <a href="https://example.com/[id]">[qui]</a>', origin="invoices")
+        say.deliver(conn, api)
+        assert api.to(OWNER) == [*kept, 'Vedi <a href="https://example.com/[id]">[qui]</a>']
+
+
 def test_a_file_is_copied_so_the_program_may_delete_its_own():
     with tempfile.TemporaryDirectory() as tmp:
         conn, owner, *_ = worker_setup(Path(tmp))

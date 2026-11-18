@@ -10,7 +10,7 @@ from pathlib import Path
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
 from zoe import health, instance
-from zoe.launcher import RESTART, decide, rollback
+from zoe.launcher import RESTART, decide, rollback, service_env
 
 
 def _git(repo: Path, *args: str) -> str:
@@ -34,6 +34,24 @@ def test_decisions():
     assert decide(1, False, "old", "old") == "retry"
     assert decide(1, True, "new", "old") == "retry"
     assert decide(1, False, "new", None) == "retry"
+
+
+def test_the_service_gets_the_env_file_as_it_is_at_each_start():
+    with tempfile.TemporaryDirectory() as tmp:
+        dotenv = Path(tmp) / ".env"
+        inherited = {"PATH": "/usr/bin", "ZOE_GREETING": "from the unit"}
+        dotenv.write_text("ZOE_GREETING=from the file\nZOE_NIGHT_MODE=on\n", encoding="utf-8")
+        first = service_env(inherited, dotenv)
+        assert first["ZOE_GREETING"] == "from the file" and first["ZOE_NIGHT_MODE"] == "on"
+        assert first["PATH"] == "/usr/bin" and first[instance.HELD] == "1"
+
+        dotenv.write_text("ZOE_GREETING=hello again\n", encoding="utf-8")
+        second = service_env(inherited, dotenv)
+        assert "ZOE_NIGHT_MODE" not in second and second["ZOE_GREETING"] == "hello again"
+
+        dotenv.unlink()
+        assert service_env(inherited, dotenv)["ZOE_GREETING"] == "from the unit"
+        assert "ZOE_NIGHT_MODE" not in os.environ
 
 
 def test_a_version_is_trusted_on_its_heartbeat_not_on_staying_up():

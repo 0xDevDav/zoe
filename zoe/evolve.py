@@ -6,6 +6,11 @@ the principles, and is then applied as one squashed commit. Every applied change
 can be undone. A core change takes effect through a graceful restart, and a
 restart that fails is rolled back by the launcher.
 
+A change to a protected part is reviewed and applied with ``--owner-approved``
+only when the owner asked for it, so the reviewer judges it knowing that. Every
+verdict is written to the history with the reviewer's words, and apply goes only
+by the last verdict recorded there for the change.
+
 Targets:
 
 - ``core``: this repository, the service code and the built-in skills;
@@ -15,7 +20,7 @@ Command line::
 
     python -m zoe.evolve start core better-glossary
     python -m zoe.evolve check core better-glossary
-    python -m zoe.evolve review core better-glossary
+    python -m zoe.evolve review core better-glossary [--owner-approved]
     python -m zoe.evolve apply core better-glossary -m "Glossary favors recent terms"
     python -m zoe.evolve discard core better-glossary
     python -m zoe.evolve undo
@@ -79,14 +84,19 @@ def _git(repo: Path, *args: str) -> str:
     return result.stdout.strip()
 
 
-def _review_prompt(target: str, principles: str, diff: str) -> str:
+def _review_prompt(target: str, principles: str, diff: str, owner_approved: bool = False) -> str:
+    owner = (
+        "The owner explicitly asked for this change, so that it changes a protected part is not a reason "
+        "to reject it: judge it against the principles like any other change.\n\n"
+        if owner_approved else ""
+    )
     return (
         f"You review a change that Zoe, a personal assistant, wants to make to her own {target}. "
         "Approve only if it follows the principles below. Reject a change that patches a symptom instead "
         "of fixing the cause, adds a special case, duplicates existing code, leaves dead code, changes "
         "behavior without a test, weakens a protected part or a test, adds comments about history or "
         "earlier versions, or puts personal data in the core.\n\n"
-        f"PRINCIPLES\n{principles}\n\nDIFF\n{diff}\n\n"
+        f"{owner}PRINCIPLES\n{principles}\n\nDIFF\n{diff}\n\n"
         "Give your reasons in at most ten lines, then end with a line that is exactly "
         "VERDICT: APPROVE or VERDICT: REJECT."
     )
@@ -153,8 +163,8 @@ class Evolution:
         self._save(target, name, checked=_git(tree, "rev-parse", "HEAD") if ok else None, protected=protected)
         return Outcome(ok, "\n".join(lines))
 
-    def review(self, target: str, name: str) -> Outcome:
-        """Have the checked change judged against the principles in force."""
+    def review(self, target: str, name: str, owner_approved: bool = False) -> Outcome:
+        """Have the checked change judged against the principles in force and log the verdict."""
         repo, tree = self._repo(target), self._existing_tree(target, name)
         head = _git(tree, "rev-parse", "HEAD")
         if self._state(target, name).get("checked") != head:
@@ -164,9 +174,12 @@ class Evolution:
         if len(diff) > _DIFF_LIMIT:
             diff = diff[:_DIFF_LIMIT] + "\n[diff truncated]"
         principles = _git(self._core, "show", f"HEAD:{PRINCIPLES}")
-        verdict = self._reviewer(_review_prompt(target, principles, diff)).strip()
+        verdict = self._reviewer(_review_prompt(target, principles, diff, owner_approved)).strip()
         approved = bool(verdict) and verdict.splitlines()[-1].strip().upper() == "VERDICT: APPROVE"
-        self._save(target, name, reviewed=head if approved else None)
+        self._log({
+            "review": f"{target}/{name}", "head": head, "approved": approved,
+            "owner_approved": owner_approved, "verdict": verdict, "at": time.time(),
+        })
         return Outcome(approved, verdict)
 
     def apply(self, target: str, name: str, message: str, owner_approved: bool = False) -> Outcome:
@@ -175,8 +188,11 @@ class Evolution:
         if _git(tree, "status", "--porcelain"):
             raise EvolveError("the change was edited after its check: run check and review again")
         state, head = self._state(target, name), _git(tree, "rev-parse", "HEAD")
-        if state.get("checked") != head or state.get("reviewed") != head:
+        review = self._last_review(target, name)
+        if state.get("checked") != head or not review or not review["approved"] or review["head"] != head:
             raise EvolveError("the change must pass check and review in its current form")
+        if owner_approved and not review["owner_approved"]:
+            raise EvolveError("--owner-approved needs a review run with --owner-approved")
         if state.get("protected") and not owner_approved:
             raise EvolveError("protected files changed: apply them only on the owner's explicit request")
         if not message.strip():
@@ -301,6 +317,11 @@ class Evolution:
         states.setdefault(f"{target}/{name}", {}).update(values)
         self._write_states(states)
 
+    def _last_review(self, target: str, name: str) -> dict | None:
+        """Return the reviewer's last verdict on a change, as the history records it."""
+        key = f"{target}/{name}"
+        return next((e for e in reversed(self._history()) if e.get("review") == key), None)
+
     def _history(self) -> list[dict]:
         if not self._history_file.exists():
             return []
@@ -319,6 +340,8 @@ def main(argv: list[str] | None = None) -> int:
         p = sub.add_parser(command)
         p.add_argument("target", choices=TARGETS)
         p.add_argument("name")
+        if command == "review":
+            p.add_argument("--owner-approved", action="store_true")
     p_apply = sub.add_parser("apply")
     p_apply.add_argument("target", choices=TARGETS)
     p_apply.add_argument("name")
@@ -338,6 +361,8 @@ def main(argv: list[str] | None = None) -> int:
             return 0
         if args.command == "apply":
             outcome = evolution.apply(args.target, args.name, args.message, args.owner_approved)
+        elif args.command == "review":
+            outcome = evolution.review(args.target, args.name, args.owner_approved)
         elif args.command == "undo":
             outcome = evolution.undo()
             outcome = outcome if outcome.ok else Outcome(False, "nothing to undo")

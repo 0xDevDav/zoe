@@ -1,5 +1,6 @@
 """Checks for the change pipeline: nothing reaches the live code without passing every gate."""
 
+import json
 import os
 import shutil
 import subprocess
@@ -85,6 +86,10 @@ def test_undo_reverts_the_last_change():
         evolution.check("core", "clearer-add")
         evolution.review("core", "clearer-add")
         evolution.apply("core", "clearer-add", "Somma con sum")
+        later = evolution.start("core", "later")
+        (later / "zoe" / "calc.py").write_text("def add(a, b):\n    return b + a\n", encoding="utf-8")
+        evolution.check("core", "later")
+        evolution.review("core", "later")
 
         assert evolution.undo().ok
         assert (repo / "zoe" / "calc.py").read_text(encoding="utf-8") == "def add(a, b):\n    return a + b\n"
@@ -134,6 +139,14 @@ def test_edits_after_the_review_need_a_new_check():
             pass
 
 
+def _refused(apply) -> bool:
+    try:
+        apply()
+    except EvolveError:
+        return True
+    return False
+
+
 def test_protected_files_need_the_owner():
     with tempfile.TemporaryDirectory(ignore_cleanup_errors=True) as tmp:
         repo, _, evolution = _setup(Path(tmp))
@@ -142,13 +155,48 @@ def test_protected_files_need_the_owner():
         report = evolution.check("core", "open-access")
         assert report.ok and "protected files changed: zoe/access.py" in report.report
         evolution.review("core", "open-access")
-        try:
-            evolution.apply("core", "open-access", "x")
-            raise AssertionError("a protected change must need the owner")
-        except EvolveError:
-            pass
+        assert _refused(lambda: evolution.apply("core", "open-access", "x"))
+        assert _refused(lambda: evolution.apply("core", "open-access", "x", owner_approved=True))
+
+        assert evolution.review("core", "open-access", owner_approved=True).ok
+        assert _refused(lambda: evolution.apply("core", "open-access", "x"))
         assert evolution.apply("core", "open-access", "Ruolo cambiato su richiesta", owner_approved=True).ok
         assert "owner" in (repo / "zoe" / "access.py").read_text(encoding="utf-8")
+
+
+def test_the_reviewer_knows_when_the_owner_asked():
+    prompts = []
+
+    def reviewer(prompt: str) -> str:
+        prompts.append(prompt)
+        return _approve(prompt)
+
+    with tempfile.TemporaryDirectory(ignore_cleanup_errors=True) as tmp:
+        _, _, evolution = _setup(Path(tmp), reviewer=reviewer)
+        tree = evolution.start("core", "open-access")
+        (tree / "zoe" / "access.py").write_text("ROLE = 'owner'\n", encoding="utf-8")
+        evolution.check("core", "open-access")
+        evolution.review("core", "open-access")
+        evolution.review("core", "open-access", owner_approved=True)
+        assert "owner explicitly asked" not in prompts[0]
+        assert "owner explicitly asked" in prompts[1] and "ROLE = 'owner'" in prompts[1]
+
+
+def test_a_review_written_by_hand_does_not_count():
+    with tempfile.TemporaryDirectory(ignore_cleanup_errors=True) as tmp:
+        repo, home, evolution = _setup(Path(tmp), reviewer=_reject)
+        tree = evolution.start("core", "open-access")
+        (tree / "zoe" / "access.py").write_text("ROLE = 'owner'\n", encoding="utf-8")
+        evolution.check("core", "open-access")
+        assert not evolution.review("core", "open-access").ok
+
+        state_file = home / "evolve" / "state.json"
+        states = json.loads(state_file.read_text(encoding="utf-8"))
+        states["core/open-access"].update(reviewed=_git(tree, "rev-parse", "HEAD"), owner_approved=True)
+        state_file.write_text(json.dumps(states), encoding="utf-8")
+
+        assert _refused(lambda: evolution.apply("core", "open-access", "x", owner_approved=True))
+        assert "member" in (repo / "zoe" / "access.py").read_text(encoding="utf-8")
 
 
 def test_private_skills_apply_without_restart():
